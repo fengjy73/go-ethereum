@@ -50,7 +50,7 @@
 3. **已完成** `v.early` 只在 `ModeRF` 且 `Parallel()` 时为真。围栏等待、前缀等待和同一发送者停靠会 `retract`，因为 signal panic 不跑 journal。自毁或清空账户时撤掉本交易提前发布的槽。
 4. **已完成** 十块 `TestFixtureEngines` 与 `go test -race`（rfexec 约 81s）通过。RF C=2 与 C=4 各 K=30、C=8 K=15 退出码 0。本机 K=3、`GOMAXPROCS=C` 的中位数几何平均：rf C=1 / serial = 1.31（目标 1.30，差 0.01）。剖面与表写在 PR #1。
 
-## Stage 2b（代码已验证，待提交；用户尚未验收）
+## Stage 2b（已提交并推送到 PR #1；用户尚未验收）
 
 目标：修好 rf-auto 的跨块先验和 `GOMAXPROCS` 竞态，让自动 C 按依赖前沿爬坡；同时再砍 C=1 的 TxView 开销。同一分支 / PR #1。十块正确性与 race 保持通过。ict21 上的 10% 与 1.30x 目标本机不能代替。
 
