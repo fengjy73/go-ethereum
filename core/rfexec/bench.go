@@ -41,6 +41,7 @@ var CSVHeader = []string{
 	"wait_final", "wait_prefix", "wait_defer", "wait_order",
 	"wait_ns", "idle_ns", "gc_pause_ns",
 	"active_c", "c_trace", "park_ns",
+	"model_c", "model_pred_ns", "model_curve",
 }
 
 // RunBench executes the requested engines. There is no warm-up. Each timed
@@ -54,10 +55,11 @@ var CSVHeader = []string{
 // from an empty prior. PriorReset uses an empty prior for every run.
 // In-block updates stay inside the run's clone.
 //
-// rf-auto keeps a separate worker-count prior. Each timed auto run of a
-// block starts from the pre-block best trial (0 on the first block). K runs
-// are not chained. After the block, the prior becomes that last run's
-// CrewBest: the best body trial, not the width left by tail drain.
+// rf-auto keeps a cost model across blocks, including under -prior reset
+// (reset clears only the per-key Beta learner). Each timed auto run of a
+// block clones the pre-block model. K runs are not chained. After the
+// block the model is the last run's, including that run's wall sample.
+// CrewBest is the body choice, not the width left by tail drain.
 func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rfstate.Pool, prior string, out io.Writer) error {
 	if runs < 1 {
 		runs = 1
@@ -71,7 +73,7 @@ func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rf
 	}
 	defer w.Flush()
 	carried := rfstate.NewLearner()
-	crewPrior := 0
+	cost := NewCostPrior()
 	for _, env := range blocks {
 		base := rfstate.NewLearner()
 		if prior == PriorCarry {
@@ -87,21 +89,19 @@ func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rf
 		var learned *rfstate.Learner
 		learnedC := -1
 		var learnedAuto *rfstate.Learner
-		nextCrew := crewPrior
+		var nextCost *CostPrior
 		sawAuto := false
 		for run := 0; run < runs; run++ {
 			for _, eng := range engines {
 				if eng == EngineAuto {
-					row, runLearner, err := timedAuto(env, pool, base, crewPrior, oracle)
+					row, runLearner, err := timedAuto(env, pool, base, cost, oracle)
 					if err != nil {
 						return fmt.Errorf("block %d engine %s run %d: %w", env.Number, eng, run, err)
 					}
 					learnedAuto = runLearner
 					sawAuto = true
-					if row.CrewBest > 0 {
-						nextCrew = row.CrewBest
-					} else if row.ActiveC > 0 {
-						nextCrew = row.ActiveC
+					if row.Cost != nil {
+						nextCost = row.Cost
 					}
 					capC := autoLimit(pool, runtime.GOMAXPROCS(0))
 					if err := w.Write(benchRecord(env, eng, capC, run, row)); err != nil {
@@ -140,8 +140,8 @@ func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rf
 			carried.Decay()
 			carried.ApplyDelta(base, learnedAuto)
 		}
-		if sawAuto {
-			crewPrior = nextCrew
+		if sawAuto && nextCost != nil {
+			cost = nextCost
 		}
 	}
 	w.Flush()
@@ -182,14 +182,17 @@ func benchRecord(env *BlockEnv, eng string, c, run int, row *Outcome) []string {
 		strconv.Itoa(active),
 		trace,
 		strconv.FormatInt(row.Counters.WaitNs, 10),
+		strconv.Itoa(row.ModelC),
+		strconv.FormatInt(row.ModelPred, 10),
+		row.ModelCurve,
 	}
 }
 
-func timedAuto(env *BlockEnv, pool *rfstate.Pool, base *rfstate.Learner, crewPrior int, oracle *Outcome) (*Outcome, *rfstate.Learner, error) {
+func timedAuto(env *BlockEnv, pool *rfstate.Pool, base *rfstate.Learner, cost *CostPrior, oracle *Outcome) (*Outcome, *rfstate.Learner, error) {
 	var before, after debug.GCStats
 	debug.ReadGCStats(&before)
 	learner := base.Clone()
-	out, err := ExecAuto(env, pool, learner, crewPrior)
+	out, err := ExecAuto(env, pool, learner, cost)
 	debug.ReadGCStats(&after)
 	if err != nil {
 		return nil, nil, err

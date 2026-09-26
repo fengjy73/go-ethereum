@@ -219,3 +219,16 @@ func pinThread(cpu int) error {
 	set.Set(cpu)
 	return unix.SchedSetaffinity(unix.Gettid(), &set)
 }
+
+// PinCurrentThread locks the calling goroutine to its OS thread and pins
+// that thread to cpu. The lock is held for the life of the goroutine: the
+// caller should not UnlockOSThread. Workers must be pinned to other CPUs
+// in the same last-level cache so the coordinator is not on a worker's CPU.
+func PinCurrentThread(cpu int) error {
+	runtime.LockOSThread()
+	if err := pinThread(cpu); err != nil {
+		runtime.UnlockOSThread()
+		return err
+	}
+	return nil
+}

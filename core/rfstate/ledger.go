@@ -58,6 +58,13 @@ type reader struct {
 	obsTx   int
 }
 
+// feeReader is a transaction that observed the coinbase fee prefix.
+type feeReader struct {
+	tx      int
+	attempt uint64
+	sum     uint256.Int
+}
+
 type keyState struct {
 	mu        sync.Mutex
 	vers      []version
@@ -90,6 +97,9 @@ type Ledger struct {
 	fees    []*uint256.Int
 	feePre  []*uint256.Int // feePre[i] is the sum of fees[0:i] once that prefix is filled
 	feeFill int            // fees[0:feeFill] are all recorded
+	// feeReaders watched a coinbase balance and the fee sum they observed.
+	// RecordFee invalidates a higher reader whose sum no longer matches.
+	feeReaders []feeReader
 
 	onInvalidate func(Victim)
 	learner      *Learner
@@ -164,6 +174,45 @@ func (l *Ledger) noteWrite(tx int, k Key) {
 		return
 	}
 	l.touch[tx].writes[k] = struct{}{}
+}
+
+// PeekBelow returns the latest version written strictly below tx. It does
+// not create a key entry and does not register a reader. The caller must
+// be the only goroutine touching the ledger; a fixed single-worker block
+// uses this so a cold read is a map miss instead of an inserted keyState,
+// a second mutex, and a reader slot. Concurrent blocks must use Read.
+func (l *Ledger) PeekBelow(tx int, k Key) ReadResult {
+	sh := &l.shards[k.stripe(l.mask)]
+	ks := sh.keys[k]
+	res := ReadResult{ObsTx: -1}
+	if ks == nil {
+		return res
+	}
+	latest := -1
+	for i := range ks.vers {
+		v := &ks.vers[i]
+		if v.tx >= tx {
+			continue
+		}
+		if latest >= 0 && v.tx <= ks.vers[latest].tx {
+			continue
+		}
+		latest = i
+	}
+	if latest < 0 {
+		return res
+	}
+	v := ks.vers[latest]
+	if v.estimate {
+		res.Estimate = true
+		res.EstTx = v.tx
+		return res
+	}
+	res.FromVersion = true
+	res.Data = v.data
+	res.ObsTx = v.tx
+	res.CodeHash = v.codeHash
+	return res
 }
 
 // Read returns the latest version written by a transaction strictly below tx.
@@ -393,6 +442,7 @@ func (l *Ledger) RemoveReaders(tx int) {
 	if tx < 0 || tx >= len(l.touch) {
 		return
 	}
+	l.removeFeeReader(tx)
 	reads := l.touch[tx].reads
 	for k := range reads {
 		delete(reads, k)
@@ -518,11 +568,12 @@ func dropProducer(ks *keyState, tx int) {
 
 // RecordFee stores the transaction-local coinbase fee. It is not a balance write.
 // A contiguous prefix sum is extended so a later SumFees of finalized lower
-// transactions does not scan the fee array.
+// transactions does not scan the fee array. A higher transaction that already
+// observed a different prefix is invalidated after the lock is released.
 func (l *Ledger) RecordFee(tx int, fee *uint256.Int) {
 	l.feeMu.Lock()
-	defer l.feeMu.Unlock()
 	if tx < 0 || tx >= len(l.fees) {
+		l.feeMu.Unlock()
 		return
 	}
 	if fee == nil {
@@ -541,12 +592,77 @@ func (l *Ledger) RecordFee(tx int, fee *uint256.Int) {
 		l.feePre[l.feeFill+1] = sum
 		l.feeFill++
 	}
+	victims := l.feeVictimsLocked(tx)
+	l.feeMu.Unlock()
+	l.fire(FeeKey(), victims)
+}
+
+// WatchFees records that tx observed sum as the fees of [0, tx). A later
+// RecordFee from a lower transaction invalidates this attempt when the sum
+// changes. The scheduler also checks the sum again before the attempt can
+// become final.
+func (l *Ledger) WatchFees(tx int, attempt uint64, sum *uint256.Int) {
+	if l == nil || tx < 0 {
+		return
+	}
+	var got uint256.Int
+	if sum != nil {
+		got.Set(sum)
+	}
+	l.feeMu.Lock()
+	for i := range l.feeReaders {
+		if l.feeReaders[i].tx == tx {
+			l.feeReaders[i].attempt = attempt
+			l.feeReaders[i].sum = got
+			l.feeMu.Unlock()
+			return
+		}
+	}
+	l.feeReaders = append(l.feeReaders, feeReader{tx: tx, attempt: attempt, sum: got})
+	l.feeMu.Unlock()
+}
+
+func (l *Ledger) removeFeeReader(tx int) {
+	l.feeMu.Lock()
+	dst := l.feeReaders[:0]
+	for _, r := range l.feeReaders {
+		if r.tx != tx {
+			dst = append(dst, r)
+		}
+	}
+	l.feeReaders = dst
+	l.feeMu.Unlock()
+}
+
+// feeVictimsLocked drops higher readers whose observed prefix no longer
+// matches. Caller holds feeMu.
+func (l *Ledger) feeVictimsLocked(tx int) []Victim {
+	var victims []Victim
+	dst := l.feeReaders[:0]
+	for _, r := range l.feeReaders {
+		if r.tx <= tx {
+			dst = append(dst, r)
+			continue
+		}
+		now := l.sumFeesLocked(r.tx)
+		if now.Cmp(&r.sum) != 0 {
+			victims = append(victims, Victim{Tx: r.tx, Attempt: r.attempt, Key: FeeKey()})
+			continue
+		}
+		dst = append(dst, r)
+	}
+	l.feeReaders = dst
+	return victims
 }
 
 // SumFees returns the sum of recorded fees of transactions in [0, before).
 func (l *Ledger) SumFees(before int) *uint256.Int {
 	l.feeMu.Lock()
 	defer l.feeMu.Unlock()
+	return l.sumFeesLocked(before)
+}
+
+func (l *Ledger) sumFeesLocked(before int) *uint256.Int {
 	if before > len(l.fees) {
 		before = len(l.fees)
 	}
@@ -554,6 +670,9 @@ func (l *Ledger) SumFees(before int) *uint256.Int {
 		before = 0
 	}
 	if before <= l.feeFill {
+		if l.feePre[before] == nil {
+			return uint256.NewInt(0)
+		}
 		return l.feePre[before]
 	}
 	sum := uint256.NewInt(0)

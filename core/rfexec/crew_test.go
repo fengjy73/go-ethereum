@@ -17,238 +17,144 @@
 package rfexec
 
 import (
+	"math"
 	"testing"
-	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 )
 
-func TestCrewWidthOneNeverGrows(t *testing.T) {
-	c := newCrew(4, 8)
-	if got := c.begin(1); got != 1 {
-		t.Fatalf("start %d", got)
+func chainEnv(n int, prev []int, gas uint64) *BlockEnv {
+	txs := make([]*types.Transaction, n)
+	for i := range txs {
+		txs[i] = types.NewTx(&types.LegacyTx{Gas: gas, To: new(common.Address)})
 	}
-	if c.Best() != 1 {
-		t.Fatalf("best %d", c.Best())
-	}
-	cur := time.Unix(1_000, 0)
-	c.now = func() time.Time { return cur }
-	c.winStart = cur
-	c.lastSample = cur
-	cur = cur.Add(10 * time.Millisecond)
-	if n, ch := c.tick(100, 0, 0, 1); n != 1 || ch {
-		t.Fatalf("first %d changed %v", n, ch)
-	}
-	cur = cur.Add(10 * time.Millisecond)
-	if n, ch := c.tick(100, 0, 0, 1); n != 1 || ch {
-		t.Fatalf("grew to %d changed %v", n, ch)
-	}
+	return &BlockEnv{Txs: txs, PrevSame: prev}
 }
 
-func TestCrewPriorStartsAtPrior(t *testing.T) {
-	c := newCrew(4, 32)
-	if got := c.begin(32); got != 4 {
-		t.Fatalf("start %d", got)
+func TestModelParallelPrefersWidth(t *testing.T) {
+	prev := []int{-1, -1, -1, -1}
+	c := newCrew(NewCostPrior(), 4, chainEnv(4, prev, 100000))
+	if got := c.begin(4); got != 4 {
+		t.Fatalf("cold parallel choice %d trace %s", got, c.Trace())
 	}
 	if c.Best() != 4 {
 		t.Fatalf("best %d", c.Best())
 	}
 }
 
-func TestCrewWidthCapsPrior(t *testing.T) {
-	c := newCrew(8, 32)
-	if got := c.begin(2); got != 2 {
-		t.Fatalf("start %d", got)
-	}
-	if c.Best() != 2 {
-		t.Fatalf("best %d", c.Best())
-	}
-}
-
-// window closes one window: one completion per active worker, at least two.
-func window(c *crew, cur *time.Time, dt time.Duration, gas uint64) (int, bool) {
-	n := c.active
-	if n < 2 {
-		n = 2
-	}
-	var got int
-	var ch bool
-	for i := 0; i < n; i++ {
-		*cur = cur.Add(dt)
-		got, ch = c.tick(gas, 0, 0, 1)
-	}
-	return got, ch
-}
-
-func TestCrewDoublesOnFaster(t *testing.T) {
-	cur := time.Unix(1_000, 0)
-	c := newCrew(4, 32)
-	c.now = func() time.Time { return cur }
-	if got := c.begin(32); got != 4 {
-		t.Fatalf("start %d", got)
-	}
-	if n, ch := window(c, &cur, 10*time.Millisecond, 100); ch || n != 4 {
-		t.Fatalf("first baseline %d changed %v", n, ch)
-	}
-	if n, ch := window(c, &cur, 10*time.Millisecond, 100); !ch || n != 8 {
-		t.Fatalf("double %d changed %v trace %s", n, ch, c.Trace())
-	}
-	if c.Best() != 4 {
-		t.Fatalf("best after baseline %d", c.Best())
-	}
-	if n, ch := window(c, &cur, 5*time.Millisecond, 100); !ch || n != 16 {
-		t.Fatalf("double again %d changed %v trace %s", n, ch, c.Trace())
-	}
-	if c.Best() != 8 {
-		t.Fatalf("best %d", c.Best())
+func TestModelChainPrefersOne(t *testing.T) {
+	// One sender: each transaction waits on the previous, so CP equals work.
+	prev := []int{-1, 0, 1, 2}
+	c := newCrew(NewCostPrior(), 4, chainEnv(4, prev, 100000))
+	if got := c.begin(4); got != 1 {
+		t.Fatalf("chain choice %d", got)
 	}
 }
 
-func TestCrewSlowerRefines(t *testing.T) {
-	cur := time.Unix(3_000, 0)
-	c := newCrew(4, 32)
-	c.now = func() time.Time { return cur }
-	c.begin(32)
-	window(c, &cur, 10*time.Millisecond, 100)
-	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
-		t.Fatalf("probe %d", n)
-	}
-	if n, ch := window(c, &cur, 40*time.Millisecond, 100); !ch || n != 4 {
-		t.Fatalf("back %d changed %v trace %s", n, ch, c.Trace())
-	}
-	n, ch := window(c, &cur, 10*time.Millisecond, 100)
-	if !ch || n != 5 {
-		t.Fatalf("refine %d changed %v trace %s", n, ch, c.Trace())
-	}
-	if c.Trace() != "4-8-4-5" {
-		t.Fatalf("trace %s", c.Trace())
-	}
-	if c.Best() != 4 {
-		t.Fatalf("best %d", c.Best())
+func TestModelRatePrefersCheaper(t *testing.T) {
+	prev := []int{-1, -1, -1, -1}
+	cost := NewCostPrior()
+	// Every feasible C has a sample, so this block does not probe.
+	// C=4 has been much slower per gas-equivalent than C=1.
+	cost.rate[1] = 1
+	cost.rate[2] = 4
+	cost.rate[3] = 6
+	cost.rate[4] = 8
+	cost.samples[1] = 1
+	cost.samples[2] = 1
+	cost.samples[3] = 1
+	cost.samples[4] = 1
+	cost.deriveInfl()
+	c := newCrew(cost, 4, chainEnv(4, prev, 100000))
+	if got := c.begin(4); got != 1 {
+		t.Fatalf("inflated C=4 chosen %d infl %v", got, cost.infl)
 	}
 }
 
-func TestCrewNoiseStays(t *testing.T) {
-	cur := time.Unix(4_000, 0)
-	c := newCrew(4, 32)
-	c.now = func() time.Time { return cur }
-	c.begin(32)
-	window(c, &cur, 10*time.Millisecond, 100)
-	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
-		t.Fatalf("probe %d", n)
-	}
-	// The same rate is not a clear improvement, so the probe returns.
-	n, ch := window(c, &cur, 10*time.Millisecond, 100)
-	if !ch || n != 4 {
-		t.Fatalf("noise stayed at %d changed %v trace %s", n, ch, c.Trace())
-	}
-	if c.Best() != 4 {
-		t.Fatalf("best %d", c.Best())
-	}
-}
-
-func TestCrewAbortStorm(t *testing.T) {
-	cur := time.Unix(5_000, 0)
-	c := newCrew(4, 8)
-	c.now = func() time.Time { return cur }
-	if c.begin(8) != 4 {
-		t.Fatal(c.active)
-	}
-	n, ch := c.tick(0, 0, 4, 0)
-	if !ch || n != 2 {
-		t.Fatalf("storm got %d changed %v", n, ch)
-	}
-	if c.Best() != 4 {
-		t.Fatalf("storm rewrote best to %d", c.Best())
-	}
-	cur = cur.Add(time.Millisecond)
-	c.tick(100, 0, 0, 1)
-	cur = cur.Add(time.Millisecond)
-	if n, ch := c.tick(100, 0, 0, 1); n != 2 || ch {
-		t.Fatalf("climbed after storm to %d changed %v", n, ch)
-	}
-	if c.Best() != 4 {
-		t.Fatalf("best after fast window %d", c.Best())
-	}
-}
-
-func TestCrewIdleStorm(t *testing.T) {
-	cur := time.Unix(2_000, 0)
-	c := newCrew(4, 8)
-	c.now = func() time.Time { return cur }
-	c.begin(8)
-	// One completion per worker closes the window. Idle of each sample is
-	// just over (active-1) times 10ms, so the sum exceeds elapsed*(active-1).
-	idle := int64(10*time.Millisecond)*3 + 1
-	var n int
-	var ch bool
-	for i := 0; i < 3; i++ {
-		cur = cur.Add(10 * time.Millisecond)
-		if n, ch = c.tick(100, idle, 0, 1); ch || n != 4 {
-			t.Fatalf("sample %d got %d changed %v", i, n, ch)
+func TestModelWidthDoesNotFlap(t *testing.T) {
+	c := newCrew(NewCostPrior(), 4, chainEnv(8, []int{-1, -1, -1, -1, -1, -1, -1, -1}, 1000))
+	c.begin(2)
+	flips := 0
+	prev := c.widthC
+	for i := 0; i < 20; i++ {
+		w := 1
+		if i%2 == 0 {
+			w = 2
+		}
+		c.observe(-1, 0, w, 0, false, 0)
+		if c.widthC != prev {
+			flips++
+			prev = c.widthC
 		}
 	}
-	cur = cur.Add(10 * time.Millisecond)
-	n, ch = c.tick(100, idle, 0, 1)
-	if !ch || n != 2 {
-		t.Fatalf("idle got %d changed %v", n, ch)
+	if flips > 2 {
+		t.Fatalf("width cap flipped %d times on a 1/2 alternation", flips)
 	}
 }
 
-func TestCrewTailDrainKeepsBest(t *testing.T) {
-	cur := time.Unix(6_000, 0)
-	c := newCrew(4, 32)
-	c.now = func() time.Time { return cur }
-	c.begin(32)
-	window(c, &cur, 10*time.Millisecond, 100)
-	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
-		t.Fatalf("probe %d", n)
+func TestModelTailKeepsBest(t *testing.T) {
+	prev := []int{-1, -1, -1, -1, -1, -1, -1, -1}
+	c := newCrew(NewCostPrior(), 4, chainEnv(8, prev, 100000))
+	if got := c.begin(4); got != 4 {
+		t.Fatalf("start %d", got)
 	}
-	n, ch := c.setWidth(1)
-	if !ch || n != 1 {
-		t.Fatalf("drain %d changed %v", n, ch)
+	// Two transactions left: tail may shrink the active count.
+	if n, _ := c.observe(0, 6, 1, 100000, true, 0); n != 1 {
+		t.Fatalf("tail active %d", n)
 	}
 	if c.Best() != 4 {
-		t.Fatalf("best after drain %d", c.Best())
+		t.Fatalf("tail rewrote best to %d trace %s", c.Best(), c.Trace())
 	}
-	cur = cur.Add(10 * time.Millisecond)
-	if n, ch := c.tick(100, 0, 0, 1); ch || n != 1 {
-		t.Fatalf("tail tick %d changed %v", n, ch)
-	}
-	cur = cur.Add(5 * time.Millisecond)
-	if n, ch := c.tick(100, 0, 0, 1); ch || n != 1 || c.Best() != 4 {
-		t.Fatalf("tail moved active %d best %d changed %v", n, c.Best(), ch)
-	}
-	n, ch = c.setWidth(32)
-	if !ch || n != 4 {
-		t.Fatalf("restore %d changed %v", n, ch)
-	}
-	if c.Best() != 4 {
-		t.Fatalf("best %d", c.Best())
+	if _, ch := c.observe(1, 7, 1, 100000, true, 0); c.Best() != 4 {
+		t.Fatalf("later tail best %d changed %v", c.Best(), ch)
 	}
 }
 
-func TestCrewRefineTriesOtherSide(t *testing.T) {
-	cur := time.Unix(7_000, 0)
-	c := newCrew(4, 32)
-	c.now = func() time.Time { return cur }
-	c.begin(32)
-	window(c, &cur, 10*time.Millisecond, 100)
-	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
-		t.Fatalf("probe %d", n)
+func TestModelProbeThenSettle(t *testing.T) {
+	prev := []int{-1, -1, -1, -1}
+	env := chainEnv(4, prev, 100000)
+	cost := NewCostPrior()
+	c := newCrew(cost, 4, env)
+	c.begin(4)
+	// Record a wall sample as if C=4 took 4x the ideal time of one worker.
+	cost.ObserveBlock(c.Best(), 4000, 400000, 4, 0, c.BodyGas(), 0)
+	c2 := newCrew(cost, 4, env)
+	got := c2.begin(4)
+	if got != 2 {
+		t.Fatalf("expected a downward probe, got %d", got)
 	}
-	if n, _ := window(c, &cur, 40*time.Millisecond, 100); n != 4 {
-		t.Fatalf("back %d trace %s", n, c.Trace())
+	cost.ObserveBlock(c2.Best(), 2000, 400000, 4, 0, c2.BodyGas(), 0)
+	c3 := newCrew(cost, 4, env)
+	got = c3.begin(4)
+	if got != 1 {
+		t.Fatalf("expected probe to 1, got %d", got)
 	}
-	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 5 {
-		t.Fatalf("refine up %d trace %s", n, c.Trace())
+	cost.ObserveBlock(1, 1000, 400000, 4, 0, c3.BodyGas(), 0)
+	c4 := newCrew(cost, 4, env)
+	got = c4.begin(4)
+	// C=1 wall was 1000 for the whole work. C=2 was 2000. C=4 was 4000.
+	// The ideal split would favour 1 because the larger counts were slower
+	// than the split predicts... rate = wall/L. L(4) is about work/4, so
+	// rate[4] = 4000 / (work/4) = 16000/work. rate[1] = 1000/work.
+	// T(4)=L(4)*rate[4]=4000, T(1)=L(1)*rate[1]=1000. Choose 1.
+	if got != 1 {
+		t.Fatalf("settled on %d, want 1", got)
 	}
-	if n, _ := window(c, &cur, 40*time.Millisecond, 100); n != 4 {
-		t.Fatalf("refine back %d trace %s", n, c.Trace())
+	if math.Abs(cost.inflation(4)-16) > 1 && cost.inflation(4) < 2 {
+		t.Fatalf("infl(4)=%v, want a clear slowdown", cost.inflation(4))
 	}
-	n, ch := window(c, &cur, 10*time.Millisecond, 100)
-	if !ch || n != 3 {
-		t.Fatalf("other side %d changed %v trace %s", n, ch, c.Trace())
+}
+
+func TestObserveBlockDerivesInflation(t *testing.T) {
+	c := NewCostPrior()
+	c.ObserveBlock(1, 1000, 100, 1, 0, 100, 0)
+	c.ObserveBlock(4, 2000, 100, 1, 0, 25, 0)
+	// rate[1]=1000/100=10, rate[4]=2000/25=80, infl[4]=8.
+	if math.Abs(c.inflation(4)-8) > 0.01 {
+		t.Fatalf("infl(4)=%v", c.inflation(4))
 	}
-	if c.Trace() != "4-8-4-5-4-3" {
-		t.Fatalf("trace %s", c.Trace())
+	if math.Abs(c.inflation(1)-1) > 0.01 {
+		t.Fatalf("infl(1)=%v", c.inflation(1))
 	}
 }

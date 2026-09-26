@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rfstate"
@@ -443,7 +444,7 @@ func TestAutoPriorSurvivesFixtureTail(t *testing.T) {
 	defer runtime.GOMAXPROCS(prev)
 	pool := rfstate.NewPool([]int{0, 1, 2, 3}, 4)
 	defer pool.Stop()
-	out, err := ExecAuto(env, pool, rfstate.NewLearner(), 4)
+	out, err := ExecAuto(env, pool, rfstate.NewLearner(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,12 +460,151 @@ func TestAutoDoesNotChangeGOMAXPROCS(t *testing.T) {
 	env := syntheticEnv(t)
 	pool := rfstate.NewPool([]int{0, 1, 2, 3}, 4)
 	defer pool.Stop()
-	if _, err := ExecAuto(env, pool, nil, 4); err != nil {
+	if _, err := ExecAuto(env, pool, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := runtime.GOMAXPROCS(0); got != 4 {
 		t.Fatalf("GOMAXPROCS %d", got)
 	}
+}
+
+// TestCoinbaseReadSurvivesShrink forces the window that dropped coinbase
+// fees on ict21: a lower transaction is still inside execute, the pool
+// shrinks to one worker, and a higher transaction reads the coinbase.
+// The read used to sample the live active count and skip the prefix fence,
+// and the balance was not registered, so the missing fee committed.
+func TestCoinbaseReadSurvivesShrink(t *testing.T) {
+	env := coinbaseShrinkEnv(t)
+	serial, err := ExecSerial(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(prev)
+	pool := rfstate.NewPool([]int{0, 1}, 2)
+	defer pool.Stop()
+	started := make(chan struct{})
+	sawHigher := make(chan struct{})
+	release := make(chan struct{})
+	env.BeforeView = func(tx int) {
+		switch tx {
+		case 0:
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+		case 1:
+			pool.SetActive(1)
+			select {
+			case <-sawHigher:
+			default:
+				close(sawHigher)
+			}
+		}
+	}
+	type result struct {
+		out *Outcome
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := ExecAuto(env, pool, rfstate.NewLearner(), nil)
+		done <- result{out, err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("lower transaction did not start")
+	}
+	select {
+	case <-sawHigher:
+	case res := <-done:
+		t.Fatalf("higher transaction did not start: %v", res.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("higher transaction did not reach its attempt")
+	}
+	close(release)
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("execution did not finish after the shrink")
+	}
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	if err := CheckAgainstSerial(serial, res.out, env.World); err != nil {
+		t.Fatalf("shrink committed a stale coinbase read: %v", err)
+	}
+}
+
+func coinbaseShrinkEnv(t *testing.T) *BlockEnv {
+	t.Helper()
+	aliceKey := mustKey(t)
+	coinKey := mustKey(t)
+	alice := crypto.PubkeyToAddress(aliceKey.PublicKey)
+	coin := crypto.PubkeyToAddress(coinKey.PublicKey)
+	bob := common.HexToAddress("0xb0b")
+	contract := common.HexToAddress("0x1000")
+	// BALANCE of the embedded coinbase, stored at slot 0.
+	code := append([]byte{0x73}, coin.Bytes()...)
+	code = append(code, 0x31, 0x60, 0x00, 0x55, 0x00)
+	header := &types.Header{
+		ParentHash: common.HexToHash("0x01"),
+		Coinbase:   coin,
+		Number:     big.NewInt(21_000_000),
+		GasLimit:   30_000_000,
+		Time:       *params.MainnetChainConfig.CancunTime + 10,
+		Difficulty: big.NewInt(0),
+		BaseFee:    big.NewInt(1_000_000_000),
+	}
+	signer := types.LatestSigner(params.MainnetChainConfig)
+	rich := new(uint256.Int).Mul(uint256.NewInt(1_000_000_000_000_000), uint256.NewInt(1000))
+	tip := big.NewInt(2_000_000_000)
+	tx0 := types.MustSignNewTx(aliceKey, signer, &types.DynamicFeeTx{
+		ChainID:   big.NewInt(1),
+		Nonce:     0,
+		GasTipCap: tip,
+		GasFeeCap: tip,
+		Gas:       21000,
+		To:        &bob,
+		Value:     big.NewInt(1),
+	})
+	tx1 := types.MustSignNewTx(coinKey, signer, &types.DynamicFeeTx{
+		ChainID:   big.NewInt(1),
+		Nonce:     0,
+		GasTipCap: big.NewInt(1_000_000_000),
+		GasFeeCap: big.NewInt(2_000_000_000),
+		Gas:       100_000,
+		To:        &contract,
+		Value:     big.NewInt(0),
+	})
+	txs := []*types.Transaction{tx0, tx1}
+	block := types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: txs})
+	env := &BlockEnv{
+		Number:    header.Number.Uint64(),
+		Header:    block.Header(),
+		BlockHash: block.Hash(),
+		Block:     block,
+		Txs:       txs,
+		World: &rfstate.World{
+			Accounts: map[common.Address]*rfstate.Account{
+				alice:    {Exists: true, Balance: rich.Clone(), Nonce: 0},
+				coin:     {Exists: true, Balance: rich.Clone(), Nonce: 0},
+				bob:      {Exists: true, Balance: uint256.NewInt(0), Nonce: 0},
+				contract: {Exists: true, Balance: uint256.NewInt(0), Nonce: 1, Code: code},
+			},
+			Slots: map[rfstate.SlotKey]common.Hash{},
+		},
+		Hashes: map[uint64]common.Hash{},
+		Chain:  newHeaderChain(params.MainnetChainConfig, block.Header(), map[uint64]common.Hash{}),
+	}
+	if err := env.prepareMessages(); err != nil {
+		t.Fatal(err)
+	}
+	return env
 }
 
 func TestLoadPostPectraShape(t *testing.T) {

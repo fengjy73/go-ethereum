@@ -40,6 +40,7 @@ func main() {
 		prior      = flag.String("prior", rfexec.PriorReset, "carry or reset")
 		gogc       = flag.Int("gogc", 100, "GOGC percent for the process")
 		outPath    = flag.String("out", "", "CSV path (default stdout)")
+		pinCoord   = flag.Bool("pin-coordinator", false, "pin the main thread to the first CPU of the first L3 group; workers use the rest of the ordered list")
 	)
 	flag.Parse()
 	if *fixtureArg == "" {
@@ -89,15 +90,35 @@ func main() {
 	if len(ordered) > 0 {
 		cpus = ordered
 	}
+	var coordCPU int
+	coordPinned := false
+	if *pinCoord {
+		if len(cpus) < 2 {
+			fmt.Fprintln(os.Stderr, "rfbench: -pin-coordinator needs at least two CPUs")
+			os.Exit(2)
+		}
+		// ordered[0] is the first CPU of the first last-level cache.
+		// Workers start at ordered[1], so the active prefix still fills
+		// that cache before spilling, and the main thread is not on a
+		// worker's CPU.
+		coordCPU = cpus[0]
+		cpus = append([]int(nil), cpus[1:]...)
+		if err := rfstate.PinCurrentThread(coordCPU); err != nil {
+			fmt.Fprintln(os.Stderr, "rfbench: pin coordinator:", err)
+			os.Exit(1)
+		}
+		coordPinned = true
+	}
 	if wantAuto && len(cpus) > maxC {
 		maxC = len(cpus)
 	}
 	// The pin list is a placement set. It must not inflate GOMAXPROCS or the
 	// worker count: a 128-CPU mask with -c 4 used to start 128 threads.
 	// rf-auto's pool, and when GOMAXPROCS is unset the process cap, equal
-	// the pin list. The cap is set once. The block gates workers in the
-	// pool and does not call GOMAXPROCS again. An explicit GOMAXPROCS is
-	// left as set.
+	// the worker pin list. Fixed engines leave that cap in place. rf-auto's
+	// coordinator loop tracks GOMAXPROCS to the active count during the
+	// block and restores the cap before the run returns. An explicit
+	// GOMAXPROCS is the cap and is not raised.
 	if _, ok := os.LookupEnv("GOMAXPROCS"); !ok {
 		runtime.GOMAXPROCS(maxC)
 	}
@@ -122,8 +143,12 @@ func main() {
 		defer f.Close()
 		out = f
 	}
-	fmt.Fprintf(os.Stderr, "rfbench blocks=%d engines=%v C=%v runs=%d cpus=%v groups=%v gogc=%d gomaxprocs=%d prior=%s\n",
-		len(blocks), engines, cs, *runs, pool.CPUs(), groups, *gogc, runtime.GOMAXPROCS(0), *prior)
+	fmt.Fprintf(os.Stderr, "rfbench blocks=%d engines=%v C=%v runs=%d cpus=%v groups=%v gogc=%d gomaxprocs=%d prior=%s pin_coordinator=%t",
+		len(blocks), engines, cs, *runs, pool.CPUs(), groups, *gogc, runtime.GOMAXPROCS(0), *prior, coordPinned)
+	if coordPinned {
+		fmt.Fprintf(os.Stderr, " coord_cpu=%d", coordCPU)
+	}
+	fmt.Fprintln(os.Stderr)
 	if pins := pool.PinReport(); len(pins) > 0 {
 		for i, p := range pins {
 			if p != "" {

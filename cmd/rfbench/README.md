@@ -54,9 +54,10 @@ setup, not an engine warm-up. Engine state is still fresh on every timed run.
 
 ```sh
 # this VM (4 cores). Pass both fixture trees; they are sorted by block number.
-# With GOMAXPROCS unset, the process sets it once to the largest -c (here 8).
-# rf-auto ignores -c. Its maximum is the pin list. GOMAXPROCS stays at that
-# cap; the pool gates how many workers take tasks.
+# With GOMAXPROCS unset, the process sets it once to the largest -c (here 8),
+# or to the worker pin list when rf-auto is selected. rf-auto ignores -c.
+# During an rf-auto block the coordinator loop sets GOMAXPROCS to the active
+# count and restores the cap before the run returns. Fixed engines do not.
 GOGC=100 ./rfbench \
   -fixtures /path/to/fixa,/path/to/fixb \
   -engines serial,occ,rf,rf-auto \
@@ -71,10 +72,30 @@ GOGC=100 ./rfbench \
 256-core host, pinned to CPUs 128-255. Run **one process per engine and
 C**, with `GOMAXPROCS=C`. The CPU list is only the pin mask: it does not
 raise `GOMAXPROCS` or the number of worker threads. If `GOMAXPROCS` is unset,
-the process sets it once to the largest `-c` value and does not change it
-again. `rf-auto` is one process whose `GOMAXPROCS` is the pin-list length
-when the variable is unset. Inactive workers wait on the pool; the process
-does not call `GOMAXPROCS` per trial.
+the process sets it once to the largest `-c` value. Fixed engines leave that
+cap in place. `rf-auto` is one process whose cap is the worker pin list
+when the variable is unset. During the block the coordinator loop tracks
+`GOMAXPROCS` to the active count and restores the cap before the run
+returns. Inactive workers wait on the pool condition.
+
+`-pin-coordinator` locks the main goroutine to the first CPU of the first
+last-level cache and starts workers on the rest of the ordered list. On
+ict21 that keeps the coordinator in the workers' CCX. Recommended command,
+with `GOMAXPROCS` unset so the cap is the worker list (127 CPUs after the
+coordinator takes one):
+
+```sh
+cpus=$(seq -s, 128 255)
+GOGC=100 ./rfbench \
+  -fixtures /path/to/fixa,/path/to/fixb \
+  -engines rf-auto \
+  -k 10 \
+  -cpus "$cpus" \
+  -pin-coordinator \
+  -prior carry \
+  -gogc 100 \
+  -out results-rf-auto.csv
+```
 
 The pin list is compacted by last-level cache before workers start. The
 group key is `shared_cpu_list` of the highest-index cache under
@@ -137,67 +158,100 @@ global hot set.
 ### Learned worker count (`rf-auto`)
 
 `-c` does not apply. One run per block uses at most as many workers as the
-pin list (also capped by `GOMAXPROCS`, which is only read, so an explicit
-`GOMAXPROCS=1` stays at one). Inactive workers leave the scheduler and wait
-on the pool condition; they are not parked inside `Step`. The process does
-not change `GOMAXPROCS` when the active count changes. A deferred update
-carries the `Drive` generation and is ignored once the next block has
-started, so a late shrink cannot leave the pool at one worker.
+pin list, also capped by the `GOMAXPROCS` captured at block start, so an
+explicit `GOMAXPROCS=1` stays at one. Inactive workers leave the scheduler
+and wait on the pool condition; they are not parked inside `Step`. The
+coordinator owns every later `GOMAXPROCS` write: it sets the count to the
+plan before workers are released, a generation-checked loop applies later
+changes, and `ExecAuto` restores the cap before it returns. A deferred
+update carries the `Drive` generation and is ignored once the next block
+has started.
 
-The active count starts at the cross-block prior, capped by the structural
-width and by that process limit. The width is the number of transactions
-from the frontier onward that are ready or running, not parked on a fence,
-and not blocked on an earlier transaction from the same sender. It is not
-the number of remaining distinct senders. A cold prior of 0 starts at 1.
-The next block's prior is `CrewBest`: the capped prior, or the trial with
-the highest measured gas per nanosecond if a window closed. K runs all
-start from the same pre-block prior. Tail drain may shrink the active
-count (the trace can still end at 1) but it does not change `CrewBest`.
+The count is `argmin T(C)`, not a hill climb on a short wall window.
 
-Samples are per-completion gas per wall nanosecond. A window closes after
-one completion per active worker (at least two), once the standard error
-is at most half the mean. A noisy pair stays open until more completions
-shrink that error. The point estimate is gas over wall time for the whole
-window, not the mean of the per-completion rates. Two windows at the
-starting count form the baseline, and the bar is the faster of the two. A
-later slower slice at that same count does not lower the bar. A probe that
-beats the bar by more than the sum of the two standard errors records that
-trial and doubles (or halves, when already at the cap). A probe that is
-slower, or only inside that noise, returns to the best trial at once and
-refines by one worker on the next window at that trial; if that step is
-slower, it tries the other direction once. A window already at the best
-trial that is inside the noise does not move, unless that refinement step
-is still pending. The watchdog halves the active count on an abort storm
-(no completion and at least one abort per active worker, or more aborts
-than completions in a closed window) or on sustained idle while the
-frontier is still wide enough, and that block does not climb back. The
-shrink does not change the recorded best, so the next block retries it.
+```
+T(C) = max(CP, Work/C) * (1 + r(C)) * rate(C)
+```
 
-Early publication of a storage slot or nonce runs only when more than one
-worker is active and the key is fenced with more single-write attempts than
-multi-write attempts. A fixed C=1 run never takes that path. Reverting the
-write inside the EVM journal retracts that version. A fence wait, prefix
-wait, or same-sender park does not run the journal, so the scheduler marks
-the attempt for retract and the next `prepare` drops those versions before
-they can be folded. A selfdestruct or empty-account wipe retracts early
-slot versions from the same transaction: the wipe and the slot would
-otherwise share a tx index, and the slot would stay visible. Publishing
-the same bytes again at transaction end does not invalidate readers.
+`CP` is the longest same-sender chain still ahead of the frontier. `Work`
+is the sum of per-transaction weights. A weight is the learned gas for
+that contract and 4-byte selector, else the running mean gas, else the
+transaction gas limit. In-block, a finished attempt replaces its weight
+with the gas it used. `r(C)` is the learned re-execution rate
+(rollbacks/executions); an in-block rate replaces it when higher.
+`rate(C)` is wall nanoseconds per gas-equivalent `L(C) = max(CP, Work/C) * (1+r)`
+measured on previous blocks, before inflation. The sample uses the gas the
+block actually burned, and the next block estimates unknown transactions as
+gas-limit times the learned actual-to-limit ratio, so the two stay on one
+scale. `infl(C) = rate(C) / rate(smallest measured C)`.
+A sample is clamped to `[0.25, 8]` times the reference rate. Wall time
+inside the block does not rank `C`. It only updates `rate` and `r` after
+the block, on the body choice.
+
+A cold model has no rates. Every `C` up to the smoothed frontier is
+eligible and inflation is 1, so the first block takes the widest plan.
+After any `C` is measured, an unmeasured `C` is ineligible except for one
+probe at the start of the block: half the best measured `C` if that half
+is unmeasured, otherwise double it, clamped to the width and the limit.
+The probe stays for the body. Checkpoints do not abandon it.
+
+The plan is recomputed at completions `n/4`, `n/2`, and `3n/4` when
+`n >= 8`, or at `n/2` when `2 <= n < 8`. A checkpoint stays on the
+incumbent unless another measured `C` is more than 5% better. The frontier
+width is an EWMA with alpha 0.25. The integer cap moves only when the
+average is a full worker away from the cap, so a 1-vs-2 flap on successive
+scheduling events does not move it. When more than two transactions remain
+in the block and at most two are left ahead of the frontier, the active
+count may shrink to the smoothed cap. That tail drain does not change
+`CrewBest`, and it is not the sample the next block learns from.
+
+`-prior reset` clears only the per-key Beta learner. The cost model is a
+property of the machine and is carried across blocks either way. Each of
+the K runs clones the pre-block model. After the block the model is the
+last run's, including that run's wall sample.
+
+`model_c` is the body choice. `model_pred_ns` is the opening full-block
+`T(model_c)` in nanoseconds, or 0 when the model has no rate yet (the
+curve is then in gas-equivalents). It is not refit to this block's wall.
+`model_curve` is `ns:` or `gas:` followed by `c=v` pairs for that same
+opening plan, so `model_pred_ns` is the pair for `model_c` when that C
+was scored up front.
+
+Early publication of a storage slot or nonce runs only when the block is
+not statically single-worker and the key is fenced with more single-write
+attempts than multi-write attempts. A fixed C=1 run never takes that path.
+`rf-auto` does not, even while the active count is 1: another worker's
+attempt can still be in flight. Reverting the write inside the EVM journal
+retracts that version. A fence wait, prefix wait, or same-sender park does
+not run the journal, so the scheduler marks the attempt for retract and
+the next `prepare` drops those versions before they can be folded. A
+selfdestruct or empty-account wipe retracts early slot versions from the
+same transaction: the wipe and the slot would otherwise share a tx index,
+and the slot would stay visible. Publishing the same bytes again at
+transaction end does not invalidate readers.
+
+A coinbase balance read is a reader of the fee aggregate, not only of the
+prefix fence. The scheduler checks the observed prefix again before the
+attempt can become final. The C=1 fast path, which skips fences, is used
+only when the engine is statically one worker for the whole block.
 
 ### CSV
 
-`block, engine, C, run, wall_ns, executions, rollbacks, invalidations, wait_final, wait_prefix, wait_defer, wait_order, wait_ns, idle_ns, gc_pause_ns, active_c, c_trace, park_ns`
+`block, engine, C, run, wall_ns, executions, rollbacks, invalidations, wait_final, wait_prefix, wait_defer, wait_order, wait_ns, idle_ns, gc_pause_ns, active_c, c_trace, park_ns, model_c, model_pred_ns, model_curve`
 
 `serial` is recorded once per run with `C=1`. `wait_ns` and `idle_ns` are
 sums across workers. `wait_order` is reserved for the later ORDER fence and
 stays zero in P0. Estimate waits in the OCC baseline are counted under
 `wait_final`. `park_ns` is the same sum as `wait_ns` (time transactions
 spent parked). `active_c` is the worker count at the end of the run.
-`c_trace` is the sequence of trials, for example `1-2-4`. For `rf-auto` the
-`C` column is the maximum the run was allowed to wake, not the chosen
-count. Fixed engines set `active_c` and `c_trace` to that fixed C. After
-every run the final accounts, storage, code, nonces, balances, and receipts
-are compared to the serial oracle. A mismatch exits non-zero.
+`c_trace` is the sequence of active counts, for example `4-1` when the body
+ran at 4 and the tail drained to 1. For `rf-auto` the `C` column is the
+maximum the run was allowed to wake, not the chosen count. `model_c` is
+the body choice. `active_c` is the count at the end of the run, which is
+often the tail. Fixed engines set `active_c` and `c_trace` to that fixed C
+and leave the model columns at zero or empty. After every run the final
+accounts, storage, code, nonces, balances, and receipts are compared to
+the serial oracle. A mismatch exits non-zero.
 
 ## Design to code
 
@@ -212,7 +266,7 @@ are compared to the serial oracle. A mismatch exits non-zero.
 | coinbase fee recorded per transaction; prefix wait only on a real balance read | `addCoinbaseFee`, `Ledger.RecordFee`, `Fold` |
 | per-key Beta, greedy P0 rule | `core/rfstate/learner.go` |
 | fixed C, pool can change C, pinned persistent workers | `core/rfstate/pool.go` |
-| learned C, width, hill-climb, watchdog | `core/rfexec/crew.go`, `ExecAuto` |
+| learned C, list-scheduling cost model, proc gate | `core/rfexec/crew.go`, `core/rfexec/proc.go`, `ExecAuto` |
 | pin active workers onto the fewest last-level caches | `core/rfstate/topology.go` |
 | early publish of a single-write hot key when C>1 | `TxView.SetState`, `TxView.SetNonce` |
 | frontier termination (no lone tail) | `sched.tryAdvanceLocked`, `Pool` stays until `Done` |
@@ -234,10 +288,11 @@ nonce or estimate miss parks on the lower transaction.
   Abandoned attempts retract the early version; there is no separate
   cascade for values derived from it beyond that invalidation.
 - No ORDER hand-off.
-- Learned C is a multiplicative hill climb on gas per nanosecond, capped
-  by the ready-transaction frontier, plus an abort/idle watchdog. It is
-  not a fitted model of critical-path width. Tail drain does not become
-  the next block's prior.
+- Learned C is the v0 list-scheduling model above: critical path, work,
+  a learned per-C rate, and a learned re-execution rate. It is not a
+  per-transaction simulator. Tail drain does not become the next block's
+  prior. The first block of a process has no rate, so its `model_pred_ns`
+  is 0.
 - Rollback restarts the transaction and fast-forwards by read sequence.
   Fast-forward skips waits; it still re-registers readers. Interpreter
   frames are not restored from the snapshot.

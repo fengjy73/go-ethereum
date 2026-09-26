@@ -60,8 +60,20 @@
 4. **已完成** C=1 跳过 fence 和 abort 原子读；账户 wipe 只读一次；固定 C=1 的 `ObserveSafeBatch` 延到块末。`TxView` 本来就实现 `vm.StateDB`，没有适配层可删。
 5. **已完成（数字未达目标）** `TestFixtureEngines` 在最终策略后通过。`go test -race` 下 `core/rfstate` 1.0s、`core/rfexec` 88.8s，退出码 0。RF C=2 与 C=4 各 K=30、C=8 K=15 在最终策略之前的固定 C 路径上退出码 0（固定 C 不走 crew）。lint 0 issues，`check_baddeps` 通过，`make all` 退出码 0。本机 K=3、`GOMAXPROCS=C`、cpus 0-3 的第二次中位数：rf C=1 / serial 几何平均 1.35（更早一次同 C=1 代码、旧 crew 的几何平均是 1.275，stage 2 提交是 1.31；1.30 没有站住）。rf-auto reset / 每块最佳固定 rf C = 1.19，carry = 1.116，都没有进 10%。22418000 的 reset 从 1 起是 1.66，carry 从 4 起是 1.03。C=1 剖面采样 10ms，TxView / Ledger / sched 的 flat 都在一两格采样里，不能用来声称桶下降；ALLOC 相对 stage 2 剖面略高。
 
+## Stage 2c（进行中，待用户验收）
+
+目标：先修 rf-auto 在收缩到 1 时漏掉 coinbase 费用的正确性；再用代价模型选 C，而不是用短窗 wall 爬坡。同一分支 / PR #1，基线 `c7c741970`。十块正确性与 race 保持通过。
+
+1. **已完成** C=1 快路径只在整块固定单 worker（`solo`）时启用。rf-auto 即使活跃数落到 1 也不跳过 fence。
+2. **已完成** coinbase 余额读登记为费用合计的读者，提交前再核对费用前缀。去掉修复后 `TestCoinbaseReadSurvivesShrink` 失败（槽值 `0x0de000cd866f8000` 对串行 `0x0de013e6f7f9d000`），恢复后通过。
+3. **已完成** 代价模型替换 wall 爬坡。开块曲线写入 CSV。速率用块末实际 gas 的 L，未知交易用 limit×util。尾部不改 `CrewBest`。
+4. **已完成** `procGate` 代际匹配后才改 `GOMAXPROCS`，`ExecAuto` 返回前恢复 cap。`TestProcGateRestoresAndIgnoresStale`、`TestAutoDoesNotChangeGOMAXPROCS`。
+5. **已完成** `-pin-coordinator` 与 README 里的 ict21 命令。本机只有一个 L3 组，量不出跨 CCX 的 10%。
+6. **已完成代码与本机测量** 1000Hz 请求、24 遍的 C=1 剖面；固定 C=1 的冷读不再插入 keyState。压力：rf-auto K=30 两轮（reset/carry）各 300 行，rf C=2/4 K=30 各 300 行，C=8 K=15 共 150 行，逐次检查通过。race 见验证记录。ict21 的 1.39× 和 “CPU>2×” 没有在 ict21 上重测。
+
 ## 验证记录
 
 - `go test ./core/rfstate` 通过，含 `TestDropEstimatesRemovesUnpublishedKey`。
 - `RF_FIXTURES=/tmp/fixa go test ./core/rfexec -run 'TestFixtureEngines|TestSynthetic|TestLoad'` 通过（约 13s，KZG 预热前）。22418000 串行约 1.87s 来自首次 point-evaluation 的 KZG 初始化，已移到计时区外。
 - **2026-09-26 续** fixtures-b（19951808、20058000、20361898、26060000、26061000）并入 `TestFixtureEngines`。十块一次通过；`rfbench -fixtures /tmp/fixa,/tmp/fixb` 退出码 0。Osaka 系统调用沿用已有 Prague pre/post 路径，未改执行器。
+- **2026-09-27 Stage 2c** `TestFixtureEngines` 7.2s 通过。`go test -race`：`core/rfstate` 1.0s，`core/rfexec` 86.3s，退出码 0。rf-auto reset/carry K=30 各 300 行，rf C=2/4 K=30 各 300 行，C=8 K=15 共 150 行，逐次对串行通过。本机 K=3 中位数几何平均 rf C=1/serial = 1.213（stage 2b 同机是 1.35；ict21 上一次是 1.39，这次没有上 ict21）。rf-auto reset 相对每块最佳固定 rf C（1/2/4）几何平均 1.02，10 块里 7 块在 10% 内；carry 1.09，5/10。第一块 `model_pred_ns` 为 0。lint 0 issues，`check_baddeps` 通过，`make all` 退出码 0。

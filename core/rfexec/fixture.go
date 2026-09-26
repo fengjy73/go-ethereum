@@ -55,6 +55,10 @@ type BlockEnv struct {
 	Senders   []common.Address
 	PrevSame  []int
 	Msgs      []*core.Message
+	// BeforeView, when set, runs at the start of an attempt before the
+	// TxView is built. Tests use it to shrink the pool while another
+	// attempt is still inside this hook. Production leaves it nil.
+	BeforeView func(tx int)
 }
 
 // LoadFixture reads one block directory of gzipped RPC dumps.

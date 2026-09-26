@@ -34,6 +34,10 @@ const (
 	KindExist
 	KindWipe
 	KindSlot
+	// KindFee is the coinbase fee aggregate, not an account field.
+	// Readers of a coinbase balance watch this key so a later RecordFee
+	// can invalidate them even if the prefix fence was skipped.
+	KindFee
 )
 
 // Key is one shared-state location.
@@ -43,6 +47,7 @@ type Key struct {
 	Slot common.Hash
 }
 
+func FeeKey() Key                        { return Key{Kind: KindFee} }
 func BalanceKey(addr common.Address) Key { return Key{Kind: KindBalance, Addr: addr} }
 func NonceKey(addr common.Address) Key   { return Key{Kind: KindNonce, Addr: addr} }
 func CodeKey(addr common.Address) Key    { return Key{Kind: KindCode, Addr: addr} }

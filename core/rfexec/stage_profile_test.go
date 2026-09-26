@@ -32,8 +32,13 @@ import (
 // RF_PROFILE=1. One process should set GOMAXPROCS to RF_PROFILE_C.
 //
 //	RF_PROFILE=1 RF_PROFILE_BLOCK=22418000 RF_PROFILE_C=1 \
+//	  RF_PROFILE_HZ=1000 RF_PROFILE_LOOPS=24 \
 //	  go test -c -o /tmp/rfprof.test ./core/rfexec/
 //	GOMAXPROCS=1 /tmp/rfprof.test -test.run TestStageProfile -test.v -test.count=1
+//
+// SetCPUProfileRate turns the profiler on. StartCPUProfile then tries to
+// force 100 Hz and prints "cannot set cpu profile rate" while leaving the
+// requested rate in place.
 func TestStageProfile(t *testing.T) {
 	if os.Getenv("RF_PROFILE") == "" {
 		t.Skip("set RF_PROFILE=1")
@@ -75,6 +80,21 @@ func TestStageProfile(t *testing.T) {
 	if c > 1 {
 		loops = 4
 	}
+	if v := os.Getenv("RF_PROFILE_LOOPS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			t.Fatalf("RF_PROFILE_LOOPS %q", v)
+		}
+		loops = n
+	}
+	hz := 100
+	if v := os.Getenv("RF_PROFILE_HZ"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			t.Fatalf("RF_PROFILE_HZ %q", v)
+		}
+		hz = n
+	}
 	cpuPath := os.Getenv("RF_PROFILE_CPU")
 	if cpuPath == "" {
 		cpuPath = fmt.Sprintf("/tmp/pprof-rf-%s-c%d.out", block, c)
@@ -83,6 +103,7 @@ func TestStageProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtime.SetCPUProfileRate(hz)
 	if err := pprof.StartCPUProfile(f); err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +116,6 @@ func TestStageProfile(t *testing.T) {
 	}
 	pprof.StopCPUProfile()
 	f.Close()
-	fmt.Printf("CPU block=%s C=%d loops=%d profile_wall=%s file=%s gomaxprocs=%d\n",
-		block, c, loops, time.Since(t0), cpuPath, runtime.GOMAXPROCS(0))
+	fmt.Printf("CPU block=%s C=%d loops=%d hz=%d profile_wall=%s file=%s gomaxprocs=%d\n",
+		block, c, loops, hz, time.Since(t0), cpuPath, runtime.GOMAXPROCS(0))
 }

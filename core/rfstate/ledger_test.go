@@ -30,6 +30,7 @@ type parallelDeps struct{}
 func (parallelDeps) PrefixFinal(int) bool { return true }
 func (parallelDeps) TxSettled(int) bool   { return true }
 func (parallelDeps) Parallel() bool       { return true }
+func (parallelDeps) Solo() bool           { return false }
 
 func TestPublishInvalidatesHigherReader(t *testing.T) {
 	var victims []Victim
@@ -179,6 +180,41 @@ func TestFeePrefixRebuildsOnRepublish(t *testing.T) {
 	}
 	if got := l.SumFees(1); got.Uint64() != 30 {
 		t.Fatalf("prefix 1 = %d", got.Uint64())
+	}
+}
+
+func TestRecordFeeInvalidatesCoinbaseReader(t *testing.T) {
+	var victims []Victim
+	l := NewLedger(2, nil, func(v Victim) { victims = append(victims, v) })
+	// Tx 1 observed an empty prefix while tx 0 had not recorded its fee.
+	l.WatchFees(1, 3, uint256.NewInt(0))
+	l.RecordFee(0, uint256.NewInt(50))
+	if len(victims) != 1 || victims[0].Tx != 1 || victims[0].Attempt != 3 || victims[0].Key != FeeKey() {
+		t.Fatalf("victims %+v", victims)
+	}
+	// The same attempt is not invalidated again. A matching observation is kept.
+	victims = nil
+	l.WatchFees(1, 4, l.SumFees(1))
+	l.RecordFee(0, uint256.NewInt(50))
+	if len(victims) != 0 {
+		t.Fatalf("unchanged fee invalidated %+v", victims)
+	}
+}
+
+func TestPeekBelowMissDoesNotCreateKey(t *testing.T) {
+	l := NewLedger(2, nil, nil)
+	k := SlotKeyOf(common.Address{1}, common.Hash{2})
+	if res := l.PeekBelow(1, k); res.FromVersion || res.Estimate {
+		t.Fatalf("cold peek %+v", res)
+	}
+	// A miss must not insert a key the later publish would treat as existing.
+	l.Publish(0, k, []byte{9}, false, nil)
+	res := l.PeekBelow(1, k)
+	if !res.FromVersion || len(res.Data) != 1 || res.Data[0] != 9 || res.ObsTx != 0 {
+		t.Fatalf("peek %+v", res)
+	}
+	if res := l.PeekBelow(0, k); res.FromVersion {
+		t.Fatal("writer saw its own version")
 	}
 }
 

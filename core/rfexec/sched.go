@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/holiman/uint256"
 )
 
 const (
@@ -41,10 +42,11 @@ const (
 	EngineOCC = "occ"
 	// EngineRF is RegionFence P0 at a fixed worker count.
 	EngineRF = "rf"
-	// EngineAuto is RegionFence with a learned worker count. The maximum
-	// is the pin-list length and the process GOMAXPROCS, which is only
-	// read. The active count is gated in the pool; this package does not
-	// change GOMAXPROCS. -c is not the active count.
+	// EngineAuto is RegionFence with a model-chosen worker count. The
+	// maximum is the pin-list length and the process GOMAXPROCS captured
+	// at block start. The coordinator's proc loop tracks GOMAXPROCS to the
+	// active count and restores the cap before ExecAuto returns. -c is not
+	// the active count.
 	EngineAuto = "rf-auto"
 
 	maxAttempts = 10000
@@ -69,14 +71,15 @@ const (
 // learner is mutated with this block's observations. Pass a clone when the
 // caller's prior must be preserved. Nil learner uses an empty prior.
 func ProcessRegionFence(env *BlockEnv, pool *rfstate.Pool, workers int, learner *rfstate.Learner) (*Outcome, error) {
-	return execParallel(env, rfstate.ModeRF, pool, workers, learner, false, 0)
+	return execParallel(env, rfstate.ModeRF, pool, workers, learner, false, nil)
 }
 
-// ExecAuto runs RegionFence with a learned active count. crewPrior is the
-// previous block's best trial (0 starts at one worker and probes up).
-// The returned outcome's CrewBest is the prior to keep for the next block.
-func ExecAuto(env *BlockEnv, pool *rfstate.Pool, learner *rfstate.Learner, crewPrior int) (*Outcome, error) {
-	return execParallel(env, rfstate.ModeRF, pool, 0, learner, true, crewPrior)
+// ExecAuto runs RegionFence with a model-chosen active count. cost is the
+// cross-block cost model (nil starts cold). The returned outcome's Cost is
+// the model after this block's wall sample, and CrewBest is the body choice
+// rather than the tail width.
+func ExecAuto(env *BlockEnv, pool *rfstate.Pool, learner *rfstate.Learner, cost *CostPrior) (*Outcome, error) {
+	return execParallel(env, rfstate.ModeRF, pool, 0, learner, true, cost)
 }
 
 // ExecEngine runs one named engine. serial ignores the pool and the learner.
@@ -85,17 +88,17 @@ func ExecEngine(env *BlockEnv, engine string, pool *rfstate.Pool, workers int, l
 	case EngineSerial:
 		return ExecSerial(env)
 	case EngineOCC:
-		return execParallel(env, rfstate.ModeOCC, pool, workers, nil, false, 0)
+		return execParallel(env, rfstate.ModeOCC, pool, workers, nil, false, nil)
 	case EngineRF:
-		return execParallel(env, rfstate.ModeRF, pool, workers, learner, false, 0)
+		return execParallel(env, rfstate.ModeRF, pool, workers, learner, false, nil)
 	case EngineAuto:
-		return ExecAuto(env, pool, learner, 0)
+		return ExecAuto(env, pool, learner, nil)
 	default:
 		return nil, fmt.Errorf("unknown engine %q", engine)
 	}
 }
 
-func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers int, learner *rfstate.Learner, auto bool, crewPrior int) (*Outcome, error) {
+func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers int, learner *rfstate.Learner, auto bool, cost *CostPrior) (*Outcome, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("nil worker pool")
 	}
@@ -119,16 +122,31 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 	s.pool = pool
 	s.procCap = procCap
 	s.auto = auto
+	s.solo = !auto && workers == 1
+	var gate *procGate
 	if auto {
 		s.mu.Lock()
 		s.width = s.frontierWidthLocked()
 		s.mu.Unlock()
 		limit := autoLimit(pool, procCap)
-		s.crew = newCrew(crewPrior, limit)
+		s.crew = newCrew(cost.Clone(), limit, env)
 		workers = s.crew.begin(s.width)
+		// Arm before Drive so a worker cannot observe an unarmed gate.
+		// Drive's generation is the current value plus one; this coordinator
+		// is the only caller. The initial GOMAXPROCS write happens here,
+		// before any worker is released. Later writes belong to the gate.
+		gate = newProcGate(procCap)
+		s.proc = gate
+		nextGen := pool.Generation() + 1
+		gate.arm(nextGen)
+		runtime.GOMAXPROCS(workers)
+		defer gate.restore()
 	}
 	s.bindWorkers(pool.Width())
-	pool.Drive(workers, s.Step, s.Done)
+	gen := pool.Drive(workers, s.Step, s.Done)
+	if gate != nil {
+		gate.arm(gen)
+	}
 	err := s.wait()
 	pool.Release()
 	if err != nil {
@@ -160,21 +178,43 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 	activeC := workers
 	trace := strconv.Itoa(workers)
 	best := 0
+	var modelC int
+	var modelPred int64
+	var modelCurve string
+	var nextCost *CostPrior
 	if s.crew != nil {
 		activeC = s.crew.Active()
 		trace = s.crew.Trace()
 		best = s.crew.Best()
+		_, modelC, modelPred, modelCurve = s.crew.Curve()
+		nextCost = s.crew.cost
+		ctr := s.counters()
+		var gasExec uint64
+		for _, r := range receipts {
+			gasExec += r.GasUsed
+		}
+		// The reported curve is the plan made before this block's wall
+		// sample. ObserveBlock updates the clone the next block will see.
+		fit := s.crew.realizedGas()
+		if fit <= 0 {
+			fit = s.crew.BodyGas()
+		}
+		nextCost.ObserveBlock(best, uint64(wall.Nanoseconds()), gasExec, ctr.Executions, ctr.Rollbacks, fit, s.crew.limitSum)
 	}
 	return &Outcome{
-		Receipts: receipts,
-		GasUsed:  gas,
-		Root:     root,
-		Store:    store,
-		Counters: s.counters(),
-		Wall:     wall,
-		ActiveC:  activeC,
-		CTrace:   trace,
-		CrewBest: best,
+		Receipts:   receipts,
+		GasUsed:    gas,
+		Root:       root,
+		Store:      store,
+		Counters:   s.counters(),
+		Wall:       wall,
+		ActiveC:    activeC,
+		CTrace:     trace,
+		CrewBest:   best,
+		Cost:       nextCost,
+		ModelC:     modelC,
+		ModelPred:  modelPred,
+		ModelCurve: modelCurve,
 	}, nil
 }
 
@@ -221,6 +261,11 @@ type txRec struct {
 	// transaction already final. A consensus error on that attempt is real.
 	// An error from an earlier attempt can be a stale speculative read.
 	lowerFinal bool
+	// sawCoin is set when the attempt read the coinbase balance. feeSum is
+	// the prefix it observed. Both are checked again before the attempt
+	// can become final.
+	sawCoin bool
+	feeSum  *uint256.Int
 }
 
 type sched struct {
@@ -242,10 +287,10 @@ type sched struct {
 	pool        *rfstate.Pool
 	procCap     int
 	auto        bool
+	solo        bool
+	proc        *procGate
 	crew        *crew
 	width       int
-	crewRoll    uint64
-	crewIdle    int64
 	pendingSafe []rfstate.Key
 }
 
@@ -290,14 +335,14 @@ func (s *sched) TxSettled(tx int) bool {
 	return st == stFinished || st == stFinal
 }
 
-// Parallel reports that more than one worker is executing. Early publication
-// is off otherwise, so a single worker does not allocate write counters.
-func (s *sched) Parallel() bool {
-	if s.pool == nil {
-		return false
-	}
-	return s.pool.Active() > 1
-}
+// Parallel reports that this block may run more than one worker. It is not
+// sampled from the live active count: a shrink must not turn the flag off
+// under an attempt that already started, and a new attempt must not skip
+// fences just because the count is currently one.
+func (s *sched) Parallel() bool { return !s.solo }
+
+// Solo is true only for a fixed single-worker block.
+func (s *sched) Solo() bool { return s.solo }
 
 // frontierWidthLocked counts transactions that can take a worker now:
 // ready or running, not parked on a fence, and not blocked on an earlier
@@ -338,9 +383,7 @@ func (s *sched) senderBlockedLocked(tx int) bool {
 // deferLearn holds safe-read observations until the block ends. Only a
 // fixed single worker does this: nothing else in the block consults the
 // learner, and the per-transaction batch was measurable bookkeeping.
-func (s *sched) deferLearn() bool {
-	return !s.auto && s.pool != nil && s.pool.Active() <= 1
-}
+func (s *sched) deferLearn() bool { return s.solo }
 
 func (s *sched) flushLearn() {
 	if s.learner == nil {
@@ -456,6 +499,9 @@ func (s *sched) execute(worker, idx int, attempt uint64, ff int) {
 		}
 	}()
 	s.prepare(idx)
+	if s.env.BeforeView != nil {
+		s.env.BeforeView(idx)
+	}
 	view := rfstate.NewTxView(s.mode, idx, attempt, ff, s.store, s.ledger, s.learner, s, &s.txs[idx].abort, s.env.Header.Coinbase)
 	defer view.Release()
 	tx := s.env.Txs[idx]
@@ -605,7 +651,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts (last signal %d depend %d)", s.env.Number, idx, maxAttempts, sig.Kind, sig.Depend)
 	}
 	s.wakeLocked()
-	applyN, doApply = s.crewSampleLocked(0, false)
+	applyN, doApply = s.crewSampleLocked(-1, 0, false)
 	s.cv.Broadcast()
 }
 
@@ -672,7 +718,7 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts: %w", s.env.Number, idx, maxAttempts, err)
 	}
 	s.wakeLocked()
-	applyN, doApply = s.crewSampleLocked(0, false)
+	applyN, doApply = s.crewSampleLocked(-1, 0, false)
 	s.cv.Broadcast()
 }
 
@@ -700,7 +746,7 @@ func (s *sched) discard(idx int, attempt uint64) {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts", s.env.Number, idx, maxAttempts)
 	}
 	s.wakeLocked()
-	applyN, doApply = s.crewSampleLocked(0, false)
+	applyN, doApply = s.crewSampleLocked(-1, 0, false)
 	s.cv.Broadcast()
 }
 
@@ -737,6 +783,13 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 		s.discard(idx, attempt)
 		return
 	}
+	if _, sum := view.CoinbaseObserved(); sum != nil {
+		s.txs[idx].sawCoin = true
+		s.txs[idx].feeSum = new(uint256.Int).Set(sum)
+	} else {
+		s.txs[idx].sawCoin = false
+		s.txs[idx].feeSum = nil
+	}
 	s.txs[idx].gasUsed = result.UsedGas
 	s.txs[idx].failed = result.Failed()
 	s.txs[idx].logs = append([]*types.Log(nil), view.Logs()...)
@@ -762,7 +815,7 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 		}
 	}
 	gas := result.UsedGas
-	applyN, doApply = s.crewSampleLocked(gas, true)
+	applyN, doApply = s.crewSampleLocked(idx, gas, true)
 	s.wakeLocked()
 	s.cv.Broadcast()
 	s.mu.Unlock()
@@ -801,6 +854,11 @@ func (s *sched) tryAdvanceLocked() []int {
 			t.validated = true
 		}
 		tx := s.frontier
+		if s.mode == rfstate.ModeRF && !s.coinFeeValidLocked(tx) {
+			s.ctr.Rollbacks++
+			s.requeueFinishedLocked(tx)
+			return finalTx
+		}
 		if s.mode == rfstate.ModeRF {
 			finalTx = append(finalTx, tx)
 		}
@@ -856,34 +914,30 @@ func (s *sched) parkDoneLocked(idx int) bool {
 	}
 }
 
-func (s *sched) crewSampleLocked(gas uint64, done bool) (int, bool) {
+func (s *sched) crewSampleLocked(tx int, gas uint64, done bool) (int, bool) {
 	if s.crew == nil {
 		return 0, false
 	}
 	w := s.frontierWidthLocked()
-	if w != s.width {
-		s.width = w
-		n, ch := s.crew.setWidth(w)
-		if ch {
-			// Drop this event's idle and aborts. Replaying them after the
-			// width cap lifts would look like a storm in the block body.
-			s.crewRoll = s.ctr.Rollbacks
-			s.crewIdle = s.ctr.IdleNs
-			return n, true
-		}
+	s.width = w
+	return s.crew.observe(tx, s.frontier, w, gas, done, s.ctr.Rollbacks)
+}
+
+// coinFeeValidLocked reports that a coinbase read, if any, still matches
+// the fee prefix now that every lower transaction is final.
+func (s *sched) coinFeeValidLocked(tx int) bool {
+	t := &s.txs[tx]
+	if !t.sawCoin {
+		return true
 	}
-	var dones uint64
-	if done {
-		dones = 1
+	now := s.ledger.SumFees(tx)
+	if t.feeSum == nil || t.feeSum.Sign() == 0 {
+		return now == nil || now.Sign() == 0
 	}
-	roll := s.ctr.Rollbacks - s.crewRoll
-	idle := s.ctr.IdleNs - s.crewIdle
-	s.crewRoll = s.ctr.Rollbacks
-	s.crewIdle = s.ctr.IdleNs
-	if !done && roll == 0 && idle == 0 {
-		return s.crew.Active(), false
+	if now == nil {
+		return false
 	}
-	return s.crew.tick(gas, idle, roll, dones)
+	return now.Cmp(t.feeSum) == 0
 }
 
 // blockGen is the Drive generation captured before the scheduler lock, so a
@@ -897,9 +951,10 @@ func (s *sched) blockGen() uint64 {
 
 // applyActive publishes a new worker count for gen. The scheduler lock is
 // not held across the pool: SetActiveIf takes the pool lock, and a worker
-// holds that lock only before Step. GOMAXPROCS is not changed. A generation
-// that Drive has already replaced is ignored, and a finished block does not
-// broadcast into the next one.
+// holds that lock only before Step. A matching generation asks the
+// coordinator's proc loop to set GOMAXPROCS; this function does not write
+// it. A generation that Drive has already replaced is ignored, and a
+// finished block does not broadcast into the next one.
 func (s *sched) applyActive(n int, gen uint64) {
 	if !s.auto || s.pool == nil {
 		return
@@ -912,6 +967,9 @@ func (s *sched) applyActive(n int, gen uint64) {
 	}
 	if !s.pool.SetActiveIf(gen, n) {
 		return
+	}
+	if s.proc != nil {
+		s.proc.request(gen, n)
 	}
 	s.mu.Lock()
 	if s.pool.Generation() == gen && !s.doneLocked() {

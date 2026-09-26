@@ -56,9 +56,19 @@ type Outcome struct {
 	ActiveC int
 	// CTrace is the sequence of chosen active counts, "4" or "1-2-4".
 	CTrace string
-	// CrewBest is the measured-best trial for the next block's rf-auto
-	// prior. Zero on fixed engines.
+	// CrewBest is the body worker count to keep for the next block.
+	// Tail drain does not change it. Zero on fixed engines.
 	CrewBest int
+	// Cost is the cost model after this block's wall sample. Nil on
+	// fixed engines.
+	Cost *CostPrior
+	// ModelC is the body choice. ModelPred is the predicted nanoseconds
+	// for that choice when the model has a wall scale, otherwise 0.
+	// ModelCurve lists T(C) for the feasible counts, prefixed by "ns:" or
+	// "gas:".
+	ModelC     int
+	ModelPred  int64
+	ModelCurve string
 }
 
 // Counters are the per-run measurements written to the benchmark CSV.

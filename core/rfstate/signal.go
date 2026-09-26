@@ -44,9 +44,14 @@ func (s Signal) Error() string { return "rfstate signal" }
 type Deps interface {
 	PrefixFinal(tx int) bool
 	TxSettled(tx int) bool
-	// Parallel is true when more than one worker is executing this block.
-	// Early publication is skipped otherwise so a single worker pays nothing.
+	// Parallel is true when more than one worker may be executing.
+	// It is not a licence to skip a correctness check.
 	Parallel() bool
+	// Solo is true only when the block is statically one worker for its
+	// whole life, so an attempt on another worker is impossible. A live
+	// active count is not enough: rf-auto can shrink while a lower
+	// attempt is still on another worker.
+	Solo() bool
 }
 
 // Mode selects the concurrency-control read path.

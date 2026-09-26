@@ -55,16 +55,19 @@ type TxView struct {
 	coinbase common.Address
 	rules    params.Rules
 
-	accs     map[common.Address]*localAcct
-	mv       map[Key]ReadResult // first read of a key in this attempt
-	early    bool               // publish final-looking hot writes before tx end
-	parallel bool               // more than one worker; C=1 skips fence and abort loads
-	wcount   map[Key]int        // writes per key, only when early
-	readSeq  int
-	regions  int
-	pass     []Key
-	wrote    []Key
-	occ      []OccRead
+	accs  map[common.Address]*localAcct
+	mv    map[Key]ReadResult // first read of a key in this attempt
+	early bool               // publish final-looking hot writes before tx end
+	// solo skips fence and abort checks. It is set only when the block is
+	// statically one worker, or when there is no scheduler. A live active
+	// count must not set it: rf-auto can shrink while another attempt runs.
+	solo    bool
+	wcount  map[Key]int // writes per key, only when early
+	readSeq int
+	regions int
+	pass    []Key
+	wrote   []Key
+	occ     []OccRead
 
 	ownFee  *uint256.Int
 	feeSum  *uint256.Int // lower-tx fees captured with the coinbase read
@@ -138,11 +141,11 @@ func NewTxView(mode Mode, tx int, attempt uint64, ffUntil int, store *Store, led
 	v.deps = deps
 	v.abort = abort
 	v.coinbase = coinbase
-	// Snapshot parallelism once. deps.Parallel takes the scheduler lock;
-	// calling it on every read was per-op bookkeeping, and a C=1 attempt
-	// never needs the fence or the abort flag.
-	v.parallel = deps != nil && deps.Parallel()
-	v.early = mode == ModeRF && v.parallel
+	// The fast path is a static property of the block, not of the current
+	// active count. rf-auto may shrink to one worker while another attempt
+	// is still running; that attempt's fee credit is still in flight.
+	v.solo = deps == nil || deps.Solo()
+	v.early = mode == ModeRF && !v.solo
 	if v.ownFee == nil {
 		v.ownFee = uint256.NewInt(0)
 	} else {
@@ -174,7 +177,7 @@ func (v *TxView) recycle() {
 	clear(v.mv)
 	clear(v.wcount)
 	v.early = false
-	v.parallel = false
+	v.solo = false
 	v.pass = v.pass[:0]
 	v.wrote = v.wrote[:0]
 	v.occ = v.occ[:0]
@@ -217,7 +220,7 @@ func (v *TxView) CoinbaseObserved() (total, feeSum *uint256.Int) {
 func (v *TxView) OwnFee() *uint256.Int { return new(uint256.Int).Set(v.ownFee) }
 
 func (v *TxView) guard() {
-	if !v.parallel || v.mode == ModeDirect || v.abort == nil {
+	if v.solo || v.mode == ModeDirect || v.abort == nil {
 		return
 	}
 	if v.abort.Load() {
@@ -269,7 +272,6 @@ func (a *localAcct) slots() {
 	}
 	a.storage = map[common.Hash]common.Hash{}
 	a.storageOrig = map[common.Hash]common.Hash{}
-	a.storageDirty = map[common.Hash]struct{}{}
 }
 
 func (v *TxView) isCoinbaseBal(k Key) bool {
@@ -283,15 +285,21 @@ func (v *TxView) readMV(k Key, doFence bool) ReadResult {
 		v.guard()
 		return ReadResult{ObsTx: -1}
 	}
+	// Fixed C=1 never overlaps attempts. Skip the per-key reader, the
+	// attempt-local mv map, and key insertion. Account and slot maps
+	// still cache the value for the rest of the attempt.
+	if v.solo && v.mode == ModeRF {
+		return v.readSolo(k)
+	}
 	if res, ok := v.mv[k]; ok {
 		return res
 	}
-	if v.parallel {
+	if !v.solo {
 		v.guard()
 	}
 	seq := v.readSeq
 	v.readSeq++
-	if v.parallel && doFence && seq >= v.ffUntil {
+	if !v.solo && doFence && seq >= v.ffUntil {
 		v.fence(k, seq)
 	}
 	register := v.mode == ModeRF && !v.isCoinbaseBal(k)
@@ -311,6 +319,18 @@ func (v *TxView) readMV(k Key, doFence bool) ReadResult {
 		v.mv = map[Key]ReadResult{}
 	}
 	v.mv[k] = res
+	return res
+}
+
+func (v *TxView) readSolo(k Key) ReadResult {
+	v.readSeq++
+	res := v.ledger.PeekBelow(v.tx, k)
+	if res.Estimate {
+		panic(Signal{Kind: SigWaitEstimate, Depend: res.EstTx, Seq: v.readSeq - 1})
+	}
+	if v.learner != nil {
+		v.ledger.noteRead(v.tx, k)
+	}
 	return res
 }
 
@@ -417,6 +437,11 @@ func (v *TxView) loadCoinbase(a *localAcct) {
 	a.balKnown = true
 	v.feeSum = new(uint256.Int).Set(sum)
 	v.coinObs = new(uint256.Int).Set(total)
+	// Register even when the prefix fence already ran. A missed fence must
+	// not be the only thing standing between this read and a later fee.
+	if v.mode == ModeRF && v.ledger != nil {
+		v.ledger.WatchFees(v.tx, v.attempt, sum)
+	}
 }
 
 func (v *TxView) loadNonce(addr common.Address, a *localAcct) {
@@ -764,7 +789,7 @@ func (v *TxView) GetState(addr common.Address, hash common.Hash) common.Hash {
 			return val
 		}
 	}
-	if v.parallel {
+	if !v.solo {
 		v.guard()
 	}
 	a := v.acct(addr)
@@ -822,6 +847,9 @@ func (v *TxView) SetState(addr common.Address, key, value common.Hash) common.Ha
 		return prev
 	}
 	old := prev
+	if a.storageDirty == nil {
+		a.storageDirty = map[common.Hash]struct{}{}
+	}
 	_, wasDirty := a.storageDirty[key]
 	k := SlotKeyOf(addr, key)
 	early := v.wantEarly(k)
