@@ -44,6 +44,9 @@ func (s Signal) Error() string { return "rfstate signal" }
 type Deps interface {
 	PrefixFinal(tx int) bool
 	TxSettled(tx int) bool
+	// Parallel is true when more than one worker is executing this block.
+	// Early publication is skipped otherwise so a single worker pays nothing.
+	Parallel() bool
 }
 
 // Mode selects the concurrency-control read path.

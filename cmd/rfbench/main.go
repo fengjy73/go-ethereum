@@ -33,8 +33,8 @@ import (
 func main() {
 	var (
 		fixtureArg = flag.String("fixtures", "", "comma-separated fixture directories (a block dir or a parent of block dirs)")
-		engineArg  = flag.String("engines", "serial,occ,rf", "comma-separated engines: serial, occ, rf")
-		cArg       = flag.String("c", "1,2,4,8", "comma-separated active worker counts")
+		engineArg  = flag.String("engines", "serial,occ,rf", "comma-separated engines: serial, occ, rf, rf-auto")
+		cArg       = flag.String("c", "1,2,4,8", "comma-separated active worker counts (ignored by rf-auto)")
 		runs       = flag.Int("k", 1, "timed runs per block and engine")
 		cpuArg     = flag.String("cpus", "", "comma-separated CPUs to pin workers to (default 0..N-1)")
 		prior      = flag.String("prior", rfexec.PriorReset, "carry or reset")
@@ -65,9 +65,38 @@ func main() {
 			maxC = c
 		}
 	}
+	wantAuto := false
+	for _, eng := range engines {
+		if eng == rfexec.EngineAuto {
+			wantAuto = true
+		}
+	}
+	// Default pin list is 0..N-1. rf-auto's maximum is this list, so it is
+	// not clipped to -c. Fixed engines still start only maxC workers.
+	if len(cpus) == 0 {
+		n := runtime.NumCPU()
+		if n < 1 {
+			n = 1
+		}
+		if !wantAuto && n > maxC {
+			n = maxC
+		}
+		for i := 0; i < n; i++ {
+			cpus = append(cpus, i)
+		}
+	}
+	ordered, groups := rfstate.LayoutCPUs(cpus)
+	if len(ordered) > 0 {
+		cpus = ordered
+	}
+	if wantAuto && len(cpus) > maxC {
+		maxC = len(cpus)
+	}
 	// The pin list is a placement set. It must not inflate GOMAXPROCS or the
 	// worker count: a 128-CPU mask with -c 4 used to start 128 threads.
-	// An explicit GOMAXPROCS (one process per C in the scan) is left as set.
+	// rf-auto is the exception: its pool and, when GOMAXPROCS is unset, the
+	// process cap equal the pin list so the block can lower GOMAXPROCS to
+	// the active trial. An explicit GOMAXPROCS is left as set.
 	if _, ok := os.LookupEnv("GOMAXPROCS"); !ok {
 		runtime.GOMAXPROCS(maxC)
 	}
@@ -92,8 +121,8 @@ func main() {
 		defer f.Close()
 		out = f
 	}
-	fmt.Fprintf(os.Stderr, "rfbench blocks=%d engines=%v C=%v runs=%d cpus=%v gogc=%d gomaxprocs=%d prior=%s\n",
-		len(blocks), engines, cs, *runs, pool.CPUs(), *gogc, runtime.GOMAXPROCS(0), *prior)
+	fmt.Fprintf(os.Stderr, "rfbench blocks=%d engines=%v C=%v runs=%d cpus=%v groups=%v gogc=%d gomaxprocs=%d prior=%s\n",
+		len(blocks), engines, cs, *runs, pool.CPUs(), groups, *gogc, runtime.GOMAXPROCS(0), *prior)
 	if pins := pool.PinReport(); len(pins) > 0 {
 		for i, p := range pins {
 			if p != "" {

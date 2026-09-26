@@ -20,8 +20,16 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
+
+// parallelDeps lets a unit test take the early-publish path without a scheduler.
+type parallelDeps struct{}
+
+func (parallelDeps) PrefixFinal(int) bool { return true }
+func (parallelDeps) TxSettled(int) bool   { return true }
+func (parallelDeps) Parallel() bool       { return true }
 
 func TestPublishInvalidatesHigherReader(t *testing.T) {
 	var victims []Victim
@@ -54,6 +62,23 @@ func TestEqualPublishDoesNotInvalidate(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("invalidations %d", n)
+	}
+}
+
+func TestRepublishInvalidatesReaderOfPreviousBytes(t *testing.T) {
+	var victims []Victim
+	l := NewLedger(3, nil, func(v Victim) { victims = append(victims, v) })
+	key := SlotKeyOf(common.Address{7}, common.Hash{1})
+	l.Publish(0, key, encHash(common.Hash{1}), false, encHash(common.Hash{}))
+	if got := l.Read(1, 4, key, true); got.ObsTx != 0 || decHash(got.Data) != (common.Hash{1}) {
+		t.Fatalf("read %+v", got)
+	}
+	victims = nil
+	if !l.Publish(0, key, encHash(common.Hash{2}), false, encHash(common.Hash{})) {
+		t.Fatal("expected a changed republish")
+	}
+	if len(victims) != 1 || victims[0].Tx != 1 || victims[0].Attempt != 4 {
+		t.Fatalf("victims %+v", victims)
 	}
 }
 
@@ -140,6 +165,23 @@ func TestCoinbaseFeesAndFoldOrder(t *testing.T) {
 	}
 }
 
+func TestFeePrefixRebuildsOnRepublish(t *testing.T) {
+	l := NewLedger(3, nil, nil)
+	l.RecordFee(0, uint256.NewInt(10))
+	l.RecordFee(1, uint256.NewInt(1))
+	l.RecordFee(2, uint256.NewInt(4))
+	if got := l.SumFees(3); got.Uint64() != 15 {
+		t.Fatalf("filled sum %d", got.Uint64())
+	}
+	l.RecordFee(0, uint256.NewInt(30))
+	if got := l.SumFees(3); got.Uint64() != 35 {
+		t.Fatalf("rebuilt sum %d", got.Uint64())
+	}
+	if got := l.SumFees(1); got.Uint64() != 30 {
+		t.Fatalf("prefix 1 = %d", got.Uint64())
+	}
+}
+
 func TestLearnerGreedy(t *testing.T) {
 	l := NewLearner()
 	k := SlotKeyOf(common.Address{1}, common.Hash{1})
@@ -205,5 +247,36 @@ func TestLearnerDecayAndDelta(t *testing.T) {
 	// the observation, which is the behavior the bench must avoid.
 	if got.Conflicts == prev.Conflicts {
 		t.Fatal("delta dropped the conflict")
+	}
+}
+
+// An early slot publish must not survive a same-transaction wipe. The wipe
+// version and the slot version share a tx index, so a later reader would
+// keep the slot unless the publish path retracts it.
+func TestEarlySlotRetractedOnWipe(t *testing.T) {
+	addr := common.Address{9}
+	slot := common.Hash{3}
+	world := &World{Accounts: map[common.Address]*Account{
+		addr: {Exists: true, Balance: uint256.NewInt(1), Nonce: 1, Code: []byte{0x00}},
+	}}
+	store := NewStore(world)
+	k := SlotKeyOf(addr, slot)
+	learner := NewLearner()
+	learner.ObserveConflict(k)
+	learner.ObserveWriteShape(k, true)
+	ledger := NewLedger(2, learner, nil)
+	v := NewTxView(ModeRF, 0, 1, 0, store, ledger, learner, parallelDeps{}, nil, common.Address{})
+	defer v.Release()
+	if v.SetState(addr, slot, common.Hash{0xab}) == (common.Hash{0xab}) {
+		t.Fatal("store was already the written value")
+	}
+	v.SelfDestruct(addr)
+	v.Finalise(params.Rules{})
+	v.Publish()
+
+	r := NewTxView(ModeRF, 1, 1, 0, store, ledger, nil, nil, nil, common.Address{})
+	defer r.Release()
+	if got := r.GetState(addr, slot); got != (common.Hash{}) {
+		t.Fatalf("wiped slot visible to later tx: %x", got)
 	}
 }

@@ -50,8 +50,12 @@ func TestSyntheticConflictAndNonceChain(t *testing.T) {
 	}
 	pool := rfstate.NewPool([]int{0, 1}, 2)
 	defer pool.Stop()
-	for _, eng := range []string{EngineOCC, EngineRF} {
-		for _, c := range []int{1, 2} {
+	for _, eng := range []string{EngineOCC, EngineRF, EngineAuto} {
+		cs := []int{1, 2}
+		if eng == EngineAuto {
+			cs = []int{0}
+		}
+		for _, c := range cs {
 			out, err := ExecEngine(env, eng, pool, c, rfstate.NewLearner())
 			if err != nil {
 				t.Fatalf("%s C=%d: %v", eng, c, err)
@@ -80,8 +84,12 @@ func TestFixtureEngines(t *testing.T) {
 			t.Fatalf("fixture %d: %v", env.Number, err)
 		}
 		t.Logf("block %d serial %s gas %d", env.Number, serial.Wall, serial.GasUsed)
-		for _, eng := range []string{EngineOCC, EngineRF} {
-			for _, c := range cs {
+		for _, eng := range []string{EngineOCC, EngineRF, EngineAuto} {
+			runC := cs
+			if eng == EngineAuto {
+				runC = []int{0}
+			}
+			for _, c := range runC {
 				out, err := ExecEngine(env, eng, pool, c, rfstate.NewLearner())
 				if err != nil {
 					t.Fatalf("%s block %d C=%d: %v", eng, env.Number, c, err)
@@ -89,7 +97,7 @@ func TestFixtureEngines(t *testing.T) {
 				if err := CheckAgainstSerial(serial, out, env.World); err != nil {
 					t.Fatalf("%s block %d C=%d: %v", eng, env.Number, c, err)
 				}
-				t.Logf("block %d %s C=%d %s execs %d rollbacks %d", env.Number, eng, c, out.Wall, out.Counters.Executions, out.Counters.Rollbacks)
+				t.Logf("block %d %s C=%d %s execs %d rollbacks %d active %d trace %s", env.Number, eng, c, out.Wall, out.Counters.Executions, out.Counters.Rollbacks, out.ActiveC, out.CTrace)
 			}
 		}
 	}
@@ -214,6 +222,164 @@ func mustKey(t *testing.T) *ecdsa.PrivateKey {
 		t.Fatal(err)
 	}
 	return k
+}
+
+// TestEarlyWriteDroppedOnWait is a speculative store followed by a fence
+// wait. The waiting attempt publishes the store, then the retry takes the
+// other branch and does not. The early bytes must not remain in the fold.
+func TestEarlyWriteDroppedOnWait(t *testing.T) {
+	env := earlyWaitEnv(t)
+	serial, err := ExecSerial(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract common.Address
+	for addr, acc := range env.World.Accounts {
+		if len(acc.Code) > 0 {
+			contract = addr
+		}
+	}
+	slot1 := common.BigToHash(big.NewInt(1))
+	if got := serial.DB.GetState(contract, slot1); got != (common.Hash{}) {
+		t.Fatalf("serial slot1 %s", got.Hex())
+	}
+	learner := rfstate.NewLearner()
+	hot := rfstate.SlotKeyOf(contract, slot1)
+	fence := rfstate.SlotKeyOf(contract, common.BigToHash(big.NewInt(2)))
+	learner.ObserveConflict(hot)
+	learner.ObserveWriteShape(hot, true)
+	for i := 0; i < 40; i++ {
+		learner.ObserveConflict(fence)
+	}
+	learner.ObserveWriteShape(fence, true)
+	pool := rfstate.NewPool([]int{0, 1}, 2)
+	defer pool.Stop()
+	var waits int
+	for i := 0; i < 20; i++ {
+		out, err := ExecEngine(env, EngineRF, pool, 2, learner.Clone())
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		waits += int(out.Counters.WaitFinal)
+		if err := CheckAgainstSerial(serial, out, env.World); err != nil {
+			t.Fatalf("run %d waits %d: %v", i, out.Counters.WaitFinal, err)
+		}
+	}
+	if waits == 0 {
+		t.Fatal("fence wait never ran; the abandoned early write was not exercised")
+	}
+}
+
+func earlyWaitEnv(t *testing.T) *BlockEnv {
+	t.Helper()
+	aliceKey := mustKey(t)
+	bobKey := mustKey(t)
+	alice := crypto.PubkeyToAddress(aliceKey.PublicKey)
+	bob := crypto.PubkeyToAddress(bobKey.PublicKey)
+	contract := common.HexToAddress("0x1000")
+	coin := common.HexToAddress("0xc0ffee")
+	// data 0x01 runs the producer: publish slot 2, burn gas, then clear slot 0.
+	// data 0x00 loads slot 0 and, when it is still nonzero, stores slot 1,
+	// then loads the fenced slot 2.
+	code := assembleEarlyWait()
+	header := &types.Header{
+		ParentHash: common.HexToHash("0x01"),
+		Coinbase:   coin,
+		Number:     big.NewInt(21_000_000),
+		GasLimit:   30_000_000,
+		Time:       *params.MainnetChainConfig.CancunTime + 10,
+		Difficulty: big.NewInt(0),
+		BaseFee:    big.NewInt(1_000_000_000),
+	}
+	signer := types.LatestSigner(params.MainnetChainConfig)
+	mk := func(key *ecdsa.PrivateKey, nonce uint64, data []byte) *types.Transaction {
+		return types.MustSignNewTx(key, signer, &types.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     nonce,
+			GasTipCap: big.NewInt(1_000_000_000),
+			GasFeeCap: big.NewInt(2_000_000_000),
+			Gas:       2_000_000,
+			To:        &contract,
+			Data:      data,
+		})
+	}
+	txs := []*types.Transaction{
+		mk(aliceKey, 0, []byte{1}),
+		mk(bobKey, 0, []byte{0}),
+	}
+	block := types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: txs})
+	world := &rfstate.World{
+		Accounts: map[common.Address]*rfstate.Account{
+			alice:    {Exists: true, Balance: uint256.NewInt(0).Mul(uint256.NewInt(1_000_000_000_000_000), uint256.NewInt(1000)), Nonce: 0},
+			bob:      {Exists: true, Balance: uint256.NewInt(0).Mul(uint256.NewInt(1_000_000_000_000_000), uint256.NewInt(1000)), Nonce: 0},
+			contract: {Exists: true, Balance: uint256.NewInt(0), Nonce: 1, Code: code},
+		},
+		Slots: map[rfstate.SlotKey]common.Hash{
+			{Addr: contract, Slot: common.BigToHash(big.NewInt(0))}: common.BigToHash(big.NewInt(1)),
+		},
+	}
+	env := &BlockEnv{
+		Number:    header.Number.Uint64(),
+		Header:    block.Header(),
+		BlockHash: block.Hash(),
+		Block:     block,
+		Txs:       txs,
+		World:     world,
+		Hashes:    map[uint64]common.Hash{},
+		Chain:     newHeaderChain(params.MainnetChainConfig, block.Header(), map[uint64]common.Hash{}),
+	}
+	if err := env.prepareMessages(); err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// assembleEarlyWait builds the two-entry contract used by TestEarlyWriteDroppedOnWait.
+func assembleEarlyWait() []byte {
+	var code []byte
+	emit := func(xs ...byte) { code = append(code, xs...) }
+	push1 := func(n byte) { emit(0x60, n) }
+	push2 := func(n uint16) { emit(0x61, byte(n>>8), byte(n)) }
+
+	push1(0)
+	emit(0x35) // CALLDATALOAD
+	emit(0x15) // ISZERO
+	tx1Jump := len(code)
+	emit(0x60, 0, 0x57) // JUMPI tx1
+
+	// Producer: SSTORE(2, 1), then 4000 warm SLOADs, then SSTORE(0, 0).
+	push1(1)
+	push1(2)
+	emit(0x55)
+	push2(4000)
+	loop := len(code)
+	emit(0x5b) // JUMPDEST
+	push1(3)
+	emit(0x54, 0x50) // SLOAD POP
+	push1(1)
+	emit(0x90, 0x03, 0x80) // SWAP1 SUB DUP1
+	emit(0x60, byte(loop), 0x57)
+	emit(0x50) // POP
+	push1(0)
+	push1(0)
+	emit(0x55, 0x00)
+
+	tx1 := len(code)
+	code[tx1Jump+1] = byte(tx1)
+	emit(0x5b)
+	push1(0)
+	emit(0x54, 0x15) // SLOAD ISZERO
+	skipJump := len(code)
+	emit(0x60, 0, 0x57)
+	push1(0xbb)
+	push1(1)
+	emit(0x55) // SSTORE(1, 0xbb)
+	skip := len(code)
+	code[skipJump+1] = byte(skip)
+	emit(0x5b)
+	push1(2)
+	emit(0x54, 0x50, 0x00) // SLOAD POP STOP
+	return code
 }
 
 func TestLoadFixtureShape(t *testing.T) {

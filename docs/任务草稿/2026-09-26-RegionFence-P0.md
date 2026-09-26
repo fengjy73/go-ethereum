@@ -41,6 +41,15 @@
 6. **已完成** carry 来自计时并行跑的冲突，并按 33/34 衰减。未围栏的键不再为了 `LowerProducer` 再锁一次键。
 7. **已完成** 十块正确性与 `go test -race` 通过（rfexec 约 78s）。本机 `GOMAXPROCS=C`、K=3 中位数：C=1 相对串行几何平均约 1.49x（目标 1.3x，未达到）；十个块的 rf(C=4) 中位数都快于 rf(C=1)。分配从约 150–520 MiB/块降到约 13–25 MiB。
 
+## Stage 2（进行中）
+
+目标：C=1 开销降到串行的 1.3 倍以内；学习得到的活跃 worker 数；热点键在便宜时提前发布。同一分支 / PR #1。十块正确性与 race 保持通过。
+
+1. **已完成（待测）** 尝试内读缓存；费用前缀和；`pickLocked` 从 frontier 起；最终化时 `ReadKeys` + `ObserveSafeBatch`（只给已有后验的键加 beta）；`Store.peek` 不拷贝账户。
+2. **已完成** `crew`：结构宽度是尚未 final 的不同发送者数；爬坡起点是跨块先验（不是上限）；量子是第一笔完成交易的 gas；变慢则退回最佳试验并停止（不再向反方向探一步）；aborts>completions 或空转超过 `(active-1)*wall` 时缩小，并且本块不再爬回去。`Step` 在 `worker >= active` 时返回。`LayoutCPUs` 按最高级 cache 的 `shared_cpu_list` 分组，不把组大小写死成 8。
+3. **已完成** `v.early` 只在 `ModeRF` 且 `Parallel()` 时为真。围栏等待、前缀等待和同一发送者停靠会 `retract`，因为 signal panic 不跑 journal。自毁或清空账户时撤掉本交易提前发布的槽。
+4. **已完成** 十块 `TestFixtureEngines` 与 `go test -race`（rfexec 约 81s）通过。RF C=2 与 C=4 各 K=30、C=8 K=15 退出码 0。本机 K=3、`GOMAXPROCS=C` 的中位数几何平均：rf C=1 / serial = 1.31（目标 1.30，差 0.01）。剖面与表写在 PR #1。
+
 ## 验证记录
 
 - `go test ./core/rfstate` 通过，含 `TestDropEstimatesRemovesUnpublishedKey`。

@@ -56,7 +56,9 @@ type TxView struct {
 	rules    params.Rules
 
 	accs    map[common.Address]*localAcct
-	fetched map[Key]bool
+	mv      map[Key]ReadResult // first read of a key in this attempt
+	early   bool               // publish final-looking hot writes before tx end
+	wcount  map[Key]int        // writes per key, only when early
 	readSeq int
 	regions int
 	pass    []Key
@@ -108,7 +110,7 @@ type localAcct struct {
 var viewPool = sync.Pool{New: func() any {
 	return &TxView{
 		accs:      map[common.Address]*localAcct{},
-		fetched:   map[Key]bool{},
+		mv:        map[Key]ReadResult{},
 		access:    newAccList(),
 		transient: map[tkey]common.Hash{},
 		ownFee:    uint256.NewInt(0),
@@ -130,6 +132,7 @@ func NewTxView(mode Mode, tx int, attempt uint64, ffUntil int, store *Store, led
 	v.deps = deps
 	v.abort = abort
 	v.coinbase = coinbase
+	v.early = mode == ModeRF && deps != nil && deps.Parallel()
 	if v.ownFee == nil {
 		v.ownFee = uint256.NewInt(0)
 	} else {
@@ -158,7 +161,9 @@ func (v *TxView) recycle() {
 		v.free = append(v.free, a)
 		delete(v.accs, addr)
 	}
-	clear(v.fetched)
+	clear(v.mv)
+	clear(v.wcount)
+	v.early = false
 	v.pass = v.pass[:0]
 	v.wrote = v.wrote[:0]
 	v.occ = v.occ[:0]
@@ -263,17 +268,18 @@ func (v *TxView) isCoinbaseBal(k Key) bool {
 // readMV selects a version and, on the first access in this attempt, applies
 // the region fence. Direct mode reports FromVersion false.
 func (v *TxView) readMV(k Key, doFence bool) ReadResult {
-	v.guard()
 	if v.mode == ModeDirect || v.ledger == nil {
+		v.guard()
 		return ReadResult{ObsTx: -1}
 	}
-	if !v.fetched[k] {
-		seq := v.readSeq
-		v.readSeq++
-		v.fetched[k] = true
-		if doFence && seq >= v.ffUntil {
-			v.fence(k, seq)
-		}
+	if res, ok := v.mv[k]; ok {
+		return res
+	}
+	v.guard()
+	seq := v.readSeq
+	v.readSeq++
+	if doFence && seq >= v.ffUntil {
+		v.fence(k, seq)
 	}
 	register := v.mode == ModeRF && !v.isCoinbaseBal(k)
 	res := v.ledger.Read(v.tx, v.attempt, k, register)
@@ -288,6 +294,10 @@ func (v *TxView) readMV(k Key, doFence bool) ReadResult {
 			FromVersion: res.FromVersion,
 		})
 	}
+	if v.mv == nil {
+		v.mv = map[Key]ReadResult{}
+	}
+	v.mv[k] = res
 	return res
 }
 
@@ -307,21 +317,20 @@ func (v *TxView) fence(k Key, seq int) {
 	if v.learner == nil || v.ledger == nil {
 		return
 	}
+	// Safe observations are the attempt's read set, recorded when the read
+	// is registered. Unfenced keys do not consult the producer list.
 	if !v.learner.Fenced(k) {
-		v.pass = append(v.pass, k)
 		return
 	}
 	v.regions++
 	v.Snapshot()
 	prod, ok := v.ledger.LowerProducer(v.tx, k)
 	if !ok || v.learner.Choose(k, true) != FenceWaitFinal {
-		v.pass = append(v.pass, k)
 		return
 	}
 	if v.deps != nil && !v.deps.TxSettled(prod) {
 		panic(Signal{Kind: SigWaitFinal, Depend: prod, Seq: seq})
 	}
-	v.pass = append(v.pass, k)
 }
 
 func (v *TxView) loadExist(addr common.Address, a *localAcct) {
@@ -331,7 +340,7 @@ func (v *TxView) loadExist(addr common.Address, a *localAcct) {
 	res := v.readMV(ExistKey(addr), true)
 	if res.FromVersion {
 		a.exists = decBool(res.Data)
-	} else if base, ok := v.store.Account(addr); ok {
+	} else if base := v.store.peek(addr); base != nil {
 		a.exists = base.Exists
 	}
 	a.existKnown = true
@@ -348,7 +357,7 @@ func (v *TxView) loadBal(addr common.Address, a *localAcct) {
 	res := v.readMV(BalanceKey(addr), true)
 	if res.FromVersion {
 		a.bal = decBalance(res.Data)
-	} else if base, ok := v.store.Account(addr); ok && base.Exists {
+	} else if base := v.store.peek(addr); base != nil && base.Exists {
 		// Own the balance. GetBalance hands this pointer to the EVM, matching
 		// StateDB, and must not alias the store.
 		a.bal = new(uint256.Int)
@@ -373,7 +382,7 @@ func (v *TxView) loadCoinbase(a *localAcct) {
 	var base *uint256.Int
 	if res.FromVersion {
 		base = decBalance(res.Data)
-	} else if acc, ok := v.store.Account(v.coinbase); ok {
+	} else if acc := v.store.peek(v.coinbase); acc != nil {
 		base = acc.Balance
 		if !a.existKnown {
 			a.exists = acc.Exists
@@ -404,7 +413,7 @@ func (v *TxView) loadNonce(addr common.Address, a *localAcct) {
 	res := v.readMV(NonceKey(addr), true)
 	if res.FromVersion {
 		a.nonce = decU64(res.Data)
-	} else if base, ok := v.store.Account(addr); ok && base.Exists {
+	} else if base := v.store.peek(addr); base != nil && base.Exists {
 		a.nonce = base.Nonce
 		if !a.existKnown {
 			a.exists = true
@@ -432,7 +441,7 @@ func (v *TxView) loadCode(addr common.Address, a *localAcct) {
 			a.exists = true
 			a.existKnown = true
 		}
-	} else if base, ok := v.store.Account(addr); ok && base.Exists {
+	} else if base := v.store.peek(addr); base != nil && base.Exists {
 		a.code = base.Code
 		a.codeHash = base.CodeHash
 		if a.codeHash == (common.Hash{}) {
@@ -596,12 +605,21 @@ func (v *TxView) accountEmptyLoaded(addr common.Address, a *localAcct) bool {
 }
 
 func (v *TxView) GetBalance(addr common.Address) *uint256.Int {
+	if a := v.accs[addr]; a != nil && a.balKnown && a.bal != nil {
+		return a.bal
+	}
 	a := v.acct(addr)
 	v.loadBal(addr, a)
 	return a.bal
 }
 
 func (v *TxView) GetNonce(addr common.Address) uint64 {
+	if a := v.accs[addr]; a != nil && a.nonceKnown && a.existKnown {
+		if !a.exists {
+			return 0
+		}
+		return a.nonce
+	}
 	a := v.acct(addr)
 	v.loadExist(addr, a)
 	if !a.exists {
@@ -619,17 +637,36 @@ func (v *TxView) SetNonce(addr common.Address, nonce uint64, reason tracing.Nonc
 		return
 	}
 	old, dirty := a.nonce, a.nonceDirty
+	k := NonceKey(addr)
+	early := v.wantEarly(k)
 	v.undo(func() {
 		a.nonce = old
 		a.nonceDirty = dirty
+		if early {
+			if dirty {
+				v.pub(k, encU64(old))
+			} else {
+				v.ledger.RetractKey(v.tx, k)
+			}
+		}
 	})
 	a.nonce = nonce
 	a.nonceKnown = true
 	a.nonceDirty = true
 	a.touched = true
+	v.noteWriteCount(k)
+	if early {
+		v.pub(k, encU64(nonce))
+	}
 }
 
 func (v *TxView) GetCodeHash(addr common.Address) common.Hash {
+	if a := v.accs[addr]; a != nil && a.codeKnown && a.existKnown {
+		if !a.exists {
+			return common.Hash{}
+		}
+		return a.codeHash
+	}
 	a := v.acct(addr)
 	v.loadExist(addr, a)
 	if !a.exists {
@@ -709,6 +746,11 @@ func (v *TxView) GetStateAndCommittedState(addr common.Address, hash common.Hash
 }
 
 func (v *TxView) GetState(addr common.Address, hash common.Hash) common.Hash {
+	if a := v.accs[addr]; a != nil && a.storage != nil {
+		if val, ok := a.storage[hash]; ok {
+			return val
+		}
+	}
 	v.guard()
 	a := v.acct(addr)
 	a.slots()
@@ -754,15 +796,32 @@ func (v *TxView) SetState(addr common.Address, key, value common.Hash) common.Ha
 	}
 	old := prev
 	_, wasDirty := a.storageDirty[key]
+	k := SlotKeyOf(addr, key)
+	early := v.wantEarly(k)
+	var prevEnc []byte
+	if early && wasDirty {
+		prevEnc = encHash(old)
+	}
 	v.undo(func() {
 		a.storage[key] = old
 		if !wasDirty {
 			delete(a.storageDirty, key)
 		}
+		if early {
+			if wasDirty {
+				v.pub(k, prevEnc)
+			} else {
+				v.ledger.RetractKey(v.tx, k)
+			}
+		}
 	})
 	a.storage[key] = value
 	a.storageDirty[key] = struct{}{}
 	a.touched = true
+	v.noteWriteCount(k)
+	if early {
+		v.pub(k, encHash(value))
+	}
 	return prev
 }
 
@@ -995,6 +1054,11 @@ func (v *TxView) Publish() {
 	}
 	for addr, a := range v.accs {
 		if a.forceDelete {
+			// A same-transaction wipe does not outrank a slot version from
+			// this tx. Drop early slot publishes so readers see the wipe.
+			if v.early {
+				v.retractEarlySlots(addr)
+			}
 			v.pub(ExistKey(addr), encBool(false))
 			v.pub(BalanceKey(addr), encBalance(uint256.NewInt(0)))
 			v.pub(NonceKey(addr), encU64(0))
@@ -1022,6 +1086,35 @@ func (v *TxView) Publish() {
 	v.ledger.RecordFee(v.tx, v.ownFee)
 	// Keys this incarnation did not publish must not remain ESTIMATE.
 	v.ledger.DropEstimates(v.tx)
+	if v.early && v.learner != nil {
+		for k, n := range v.wcount {
+			v.learner.ObserveWriteShape(k, n == 1)
+		}
+	}
+}
+
+func (v *TxView) retractEarlySlots(addr common.Address) {
+	for k := range v.wcount {
+		if k.Kind == KindSlot && k.Addr == addr {
+			v.ledger.RetractKey(v.tx, k)
+		}
+	}
+}
+
+func (v *TxView) noteWriteCount(k Key) {
+	if !v.early {
+		return
+	}
+	if v.wcount == nil {
+		v.wcount = map[Key]int{}
+	}
+	v.wcount[k]++
+}
+
+// wantEarly publishes this write before transaction end only when more than
+// one worker is running and past attempts usually wrote the key once.
+func (v *TxView) wantEarly(k Key) bool {
+	return v.early && v.learner != nil && v.learner.EarlyWrite(k)
 }
 
 func (v *TxView) publishBalance(addr common.Address, a *localAcct) {
@@ -1046,23 +1139,23 @@ func (v *TxView) pub(k Key, data []byte) {
 func (v *TxView) baseBytes(k Key) []byte {
 	switch k.Kind {
 	case KindBalance:
-		if a, ok := v.store.Account(k.Addr); ok {
+		if a := v.store.peek(k.Addr); a != nil {
 			return encBalance(a.Balance)
 		}
 		return encBalance(nil)
 	case KindNonce:
-		if a, ok := v.store.Account(k.Addr); ok {
+		if a := v.store.peek(k.Addr); a != nil {
 			return encU64(a.Nonce)
 		}
 		return encU64(0)
 	case KindCode:
-		if a, ok := v.store.Account(k.Addr); ok {
+		if a := v.store.peek(k.Addr); a != nil {
 			// Store code is immutable. Equality checks must not copy it.
 			return a.Code
 		}
 		return nil
 	case KindExist:
-		if a, ok := v.store.Account(k.Addr); ok {
+		if a := v.store.peek(k.Addr); a != nil {
 			return encBool(a.Exists)
 		}
 		return encBool(false)

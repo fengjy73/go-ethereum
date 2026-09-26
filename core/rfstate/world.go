@@ -79,17 +79,27 @@ func NewStore(world *World) *Store {
 // World returns the underlying prestate.
 func (s *Store) World() *World { return s.world }
 
-// Account resolves the committed account, overlay first.
+// Account resolves the committed account, overlay first. The result is a copy.
 func (s *Store) Account(addr common.Address) (Account, bool) {
-	if a, ok := s.acc[addr]; ok {
+	if a := s.peek(addr); a != nil {
 		return cloneAccount(a), true
 	}
-	if s.world != nil {
-		if a, ok := s.world.Accounts[addr]; ok {
-			return cloneAccount(a), true
-		}
-	}
 	return Account{Balance: uint256.NewInt(0)}, false
+}
+
+// peek returns the stored account without copying. Callers must not mutate it.
+// Parallel execution only reads the store; the overlay is written after workers stop.
+func (s *Store) peek(addr common.Address) *Account {
+	if s == nil {
+		return nil
+	}
+	if a, ok := s.acc[addr]; ok {
+		return a
+	}
+	if s.world != nil {
+		return s.world.Accounts[addr]
+	}
+	return nil
 }
 
 // Slot resolves a committed storage value. A wiped account hides prestate slots

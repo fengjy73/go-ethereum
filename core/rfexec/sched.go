@@ -20,10 +20,13 @@ import (
 	"bytes"
 	"fmt"
 	"math/big"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rfstate"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -37,8 +40,12 @@ const (
 	EngineSerial = "serial"
 	// EngineOCC is the Block-STM-style baseline.
 	EngineOCC = "occ"
-	// EngineRF is RegionFence P0.
+	// EngineRF is RegionFence P0 at a fixed worker count.
 	EngineRF = "rf"
+	// EngineAuto is RegionFence with a learned worker count. The maximum
+	// is the pin-list length (and GOMAXPROCS at process start); -c is not
+	// the active count.
+	EngineAuto = "rf-auto"
 
 	maxAttempts = 10000
 	// maxSettledSpins caps immediate re-executions of a wait whose producer
@@ -62,7 +69,14 @@ const (
 // learner is mutated with this block's observations. Pass a clone when the
 // caller's prior must be preserved. Nil learner uses an empty prior.
 func ProcessRegionFence(env *BlockEnv, pool *rfstate.Pool, workers int, learner *rfstate.Learner) (*Outcome, error) {
-	return execParallel(env, rfstate.ModeRF, pool, workers, learner)
+	return execParallel(env, rfstate.ModeRF, pool, workers, learner, false, 0)
+}
+
+// ExecAuto runs RegionFence with a learned active count. crewPrior is the
+// previous block's best trial (0 starts at one worker and probes up).
+// The returned outcome's CrewBest is the prior to keep for the next block.
+func ExecAuto(env *BlockEnv, pool *rfstate.Pool, learner *rfstate.Learner, crewPrior int) (*Outcome, error) {
+	return execParallel(env, rfstate.ModeRF, pool, 0, learner, true, crewPrior)
 }
 
 // ExecEngine runs one named engine. serial ignores the pool and the learner.
@@ -71,24 +85,27 @@ func ExecEngine(env *BlockEnv, engine string, pool *rfstate.Pool, workers int, l
 	case EngineSerial:
 		return ExecSerial(env)
 	case EngineOCC:
-		return execParallel(env, rfstate.ModeOCC, pool, workers, nil)
+		return execParallel(env, rfstate.ModeOCC, pool, workers, nil, false, 0)
 	case EngineRF:
-		return execParallel(env, rfstate.ModeRF, pool, workers, learner)
+		return execParallel(env, rfstate.ModeRF, pool, workers, learner, false, 0)
+	case EngineAuto:
+		return ExecAuto(env, pool, learner, 0)
 	default:
 		return nil, fmt.Errorf("unknown engine %q", engine)
 	}
 }
 
-func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers int, learner *rfstate.Learner) (*Outcome, error) {
+func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers int, learner *rfstate.Learner, auto bool, crewPrior int) (*Outcome, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("nil worker pool")
 	}
-	if workers < 1 {
+	if !auto && workers < 1 {
 		workers = 1
 	}
 	if learner == nil && mode == rfstate.ModeRF {
 		learner = rfstate.NewLearner()
 	}
+	procCap := runtime.GOMAXPROCS(0)
 	store := rfstate.NewStore(env.World)
 	warmCrypto()
 	t0 := time.Now()
@@ -99,6 +116,17 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		return nil, errPre
 	}
 	s := newSched(env, mode, store, learner)
+	s.pool = pool
+	s.procCap = procCap
+	s.auto = auto
+	if auto {
+		s.initWidth()
+		limit := autoLimit(pool, procCap)
+		s.crew = newCrew(crewPrior, limit)
+		workers = s.crew.begin(s.width)
+		runtime.GOMAXPROCS(workers)
+		defer runtime.GOMAXPROCS(procCap)
+	}
 	s.bindWorkers(pool.Width())
 	pool.Drive(workers, s.Step, s.Done)
 	err := s.wait()
@@ -128,6 +156,14 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 	for _, r := range receipts {
 		gas += r.GasUsed
 	}
+	activeC := workers
+	trace := strconv.Itoa(workers)
+	best := 0
+	if s.crew != nil {
+		activeC = s.crew.Active()
+		trace = s.crew.Trace()
+		best = s.crew.Best()
+	}
 	return &Outcome{
 		Receipts: receipts,
 		GasUsed:  gas,
@@ -135,7 +171,29 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		Store:    store,
 		Counters: s.counters(),
 		Wall:     wall,
+		ActiveC:  activeC,
+		CTrace:   trace,
+		CrewBest: best,
 	}, nil
+}
+
+// autoLimit is the most workers rf-auto may wake: the pool, the pin list,
+// and GOMAXPROCS captured at block start. Fixed -c runs do not use this.
+func autoLimit(pool *rfstate.Pool, procCap int) int {
+	n := 1
+	if pool != nil {
+		n = pool.Width()
+		if c := len(pool.CPUs()); c > 0 && c < n {
+			n = c
+		}
+	}
+	if procCap > 0 && procCap < n {
+		n = procCap
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 type txRec struct {
@@ -151,7 +209,6 @@ type txRec struct {
 	failed     bool
 	logs       []*types.Log
 	reads      []rfstate.OccRead
-	pass       []rfstate.Key
 	park       int
 	parkKind   rfstate.SigKind
 	waiting    bool
@@ -180,6 +237,16 @@ type sched struct {
 	ctr      Counters
 	evms     []*vm.EVM
 	jumps    vm.JumpDestCache
+
+	pool       *rfstate.Pool
+	procCap    int
+	auto       bool
+	crew       *crew
+	senderLeft map[common.Address]int
+	width      int
+	widthDirty bool
+	crewRoll   uint64
+	crewIdle   int64
 }
 
 func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *rfstate.Learner) *sched {
@@ -223,6 +290,43 @@ func (s *sched) TxSettled(tx int) bool {
 	return st == stFinished || st == stFinal
 }
 
+// Parallel reports that more than one worker is executing. Early publication
+// is off otherwise, so a single worker does not allocate write counters.
+func (s *sched) Parallel() bool {
+	if s.pool == nil {
+		return false
+	}
+	return s.pool.Active() > 1
+}
+
+func (s *sched) initWidth() {
+	s.senderLeft = make(map[common.Address]int)
+	for _, addr := range s.env.Senders {
+		s.senderLeft[addr]++
+	}
+	s.width = len(s.senderLeft)
+	if s.width < 1 {
+		s.width = 1
+	}
+}
+
+func (s *sched) noteSenderFinal(tx int) {
+	if s.crew == nil || tx < 0 || tx >= len(s.env.Senders) {
+		return
+	}
+	addr := s.env.Senders[tx]
+	n := s.senderLeft[addr]
+	if n <= 0 {
+		return
+	}
+	n--
+	s.senderLeft[addr] = n
+	if n == 0 && s.width > 1 {
+		s.width--
+		s.widthDirty = true
+	}
+}
+
 func (s *sched) Done() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -251,7 +355,7 @@ func (s *sched) counters() Counters {
 func (s *sched) Step(worker int) {
 	s.mu.Lock()
 	for {
-		if s.doneLocked() {
+		if s.doneLocked() || s.aboveActive(worker) {
 			s.mu.Unlock()
 			return
 		}
@@ -275,8 +379,17 @@ func (s *sched) Step(worker int) {
 	}
 }
 
+func (s *sched) aboveActive(worker int) bool {
+	if s.pool == nil {
+		return false
+	}
+	return worker >= s.pool.Active()
+}
+
 func (s *sched) pickLocked() int {
-	for i := range s.txs {
+	// Everything below the frontier is final. Scanning it made C=1 quadratic
+	// in the number of transactions.
+	for i := s.frontier; i < len(s.txs); i++ {
 		if s.txs[i].status != stReady {
 			continue
 		}
@@ -410,6 +523,13 @@ func (s *sched) aborted(idx int, attempt uint64, evm *vm.EVM) bool {
 }
 
 func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
+	var applyN int
+	var doApply bool
+	defer func() {
+		if doApply {
+			s.applyActive(applyN)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
@@ -445,6 +565,12 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 			s.txs[idx].settledSpins = 0
 		}
 		s.txs[idx].attempt++
+		// The panic skipped journal undos, so an early publish from this
+		// attempt is still in the ledger. The retry must drop it before
+		// those bytes can be folded; a later incarnation may not write the key.
+		if s.mode == rfstate.ModeRF {
+			s.txs[idx].retract = true
+		}
 	default:
 		s.requeueRunningLocked(idx)
 	}
@@ -452,6 +578,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts (last signal %d depend %d)", s.env.Number, idx, maxAttempts, sig.Kind, sig.Depend)
 	}
 	s.wakeLocked()
+	applyN, doApply = s.crewSampleLocked(0, false)
 	s.cv.Broadcast()
 }
 
@@ -465,6 +592,13 @@ func (s *sched) noteWaitLocked(k rfstate.SigKind) {
 }
 
 func (s *sched) onErr(idx int, attempt uint64, err error) {
+	var applyN int
+	var doApply bool
+	defer func() {
+		if doApply {
+			s.applyActive(applyN)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
@@ -495,6 +629,11 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 				s.txs[idx].deferNoted = true
 				s.ctr.WaitDefer++
 			}
+			// Same as a fence wait: this attempt's early publishes did not
+			// roll back with the EVM journal.
+			if s.mode == rfstate.ModeRF {
+				s.txs[idx].retract = true
+			}
 			s.wakeLocked()
 			s.cv.Broadcast()
 			return
@@ -505,10 +644,18 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts: %w", s.env.Number, idx, maxAttempts, err)
 	}
 	s.wakeLocked()
+	applyN, doApply = s.crewSampleLocked(0, false)
 	s.cv.Broadcast()
 }
 
 func (s *sched) discard(idx int, attempt uint64) {
+	var applyN int
+	var doApply bool
+	defer func() {
+		if doApply {
+			s.applyActive(applyN)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
@@ -524,6 +671,7 @@ func (s *sched) discard(idx int, attempt uint64) {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts", s.env.Number, idx, maxAttempts)
 	}
 	s.wakeLocked()
+	applyN, doApply = s.crewSampleLocked(0, false)
 	s.cv.Broadcast()
 }
 
@@ -542,6 +690,13 @@ func (s *sched) requeueRunningLocked(idx int) {
 }
 
 func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *core.ExecutionResult) {
+	var applyN int
+	var doApply bool
+	defer func() {
+		if doApply {
+			s.applyActive(applyN)
+		}
+	}()
 	if s.mode == rfstate.ModeOCC {
 		s.bump(idx, view.WroteKeys())
 	}
@@ -556,25 +711,30 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 	s.txs[idx].failed = result.Failed()
 	s.txs[idx].logs = append([]*types.Log(nil), view.Logs()...)
 	s.txs[idx].reads = append([]rfstate.OccRead(nil), view.OccReads()...)
-	s.txs[idx].pass = append([]rfstate.Key(nil), view.PassKeys()...)
 	s.txs[idx].validated = s.mode != rfstate.ModeOCC
 	s.txs[idx].settledSpins = 0
 	s.txs[idx].status = stFinished
 	s.txs[idx].evm = nil
 	s.inflight--
-	safe := s.tryAdvanceLocked()
+	finalTx := s.tryAdvanceLocked()
+	// Copy read keys before unlock. ClearVersions runs as soon as wait()
+	// observes a finished block, and a worker can still be in finish then.
+	var safe []rfstate.Key
+	if s.learner != nil {
+		for _, tx := range finalTx {
+			safe = append(safe, s.ledger.ReadKeys(tx)...)
+		}
+	}
+	gas := result.UsedGas
+	applyN, doApply = s.crewSampleLocked(gas, true)
 	s.wakeLocked()
 	s.cv.Broadcast()
 	s.mu.Unlock()
-	if s.learner != nil {
-		for _, k := range safe {
-			s.learner.ObserveSafe(k)
-		}
-	}
+	s.learner.ObserveSafeBatch(safe)
 }
 
-func (s *sched) tryAdvanceLocked() []rfstate.Key {
-	var safe []rfstate.Key
+func (s *sched) tryAdvanceLocked() []int {
+	var finalTx []int
 	for s.frontier < len(s.txs) {
 		t := &s.txs[s.frontier]
 		if t.status == stFinal {
@@ -582,7 +742,7 @@ func (s *sched) tryAdvanceLocked() []rfstate.Key {
 			continue
 		}
 		if t.status != stFinished {
-			return safe
+			return finalTx
 		}
 		if s.mode == rfstate.ModeOCC && !t.validated {
 			ok, est := s.validateLocked(s.frontier)
@@ -593,22 +753,24 @@ func (s *sched) tryAdvanceLocked() []rfstate.Key {
 				t.waiting = true
 				t.waitStart = time.Now()
 				s.ctr.WaitFinal++
-				return safe
+				return finalTx
 			}
 			if !ok {
 				s.ctr.Rollbacks++
 				s.requeueFinishedLocked(s.frontier)
-				return safe
+				return finalTx
 			}
 			t.validated = true
 		}
+		tx := s.frontier
 		if s.mode == rfstate.ModeRF {
-			safe = append(safe, t.pass...)
+			finalTx = append(finalTx, tx)
 		}
 		t.status = stFinal
+		s.noteSenderFinal(tx)
 		s.frontier++
 	}
-	return safe
+	return finalTx
 }
 
 func (s *sched) validateLocked(tx int) (bool, int) {
@@ -655,6 +817,51 @@ func (s *sched) parkDoneLocked(idx int) bool {
 	default:
 		return true
 	}
+}
+
+func (s *sched) crewSampleLocked(gas uint64, done bool) (int, bool) {
+	if s.crew == nil {
+		return 0, false
+	}
+	if s.widthDirty {
+		n, ch := s.crew.setWidth(s.width)
+		s.widthDirty = false
+		if ch {
+			return n, true
+		}
+	}
+	var dones uint64
+	if done {
+		dones = 1
+	}
+	roll := s.ctr.Rollbacks - s.crewRoll
+	idle := s.ctr.IdleNs - s.crewIdle
+	s.crewRoll = s.ctr.Rollbacks
+	s.crewIdle = s.ctr.IdleNs
+	if !done && roll == 0 && idle == 0 {
+		return s.crew.Active(), false
+	}
+	return s.crew.tick(gas, idle, roll, dones)
+}
+
+// applyActive publishes a new worker count. The scheduler lock is not held:
+// SetActive takes the pool lock, and the pool calls Step which takes the
+// scheduler lock.
+func (s *sched) applyActive(n int) {
+	if !s.auto || s.pool == nil {
+		return
+	}
+	if n < 1 {
+		n = 1
+	}
+	if s.procCap > 0 && n > s.procCap {
+		n = s.procCap
+	}
+	runtime.GOMAXPROCS(n)
+	s.pool.SetActive(n)
+	s.mu.Lock()
+	s.cv.Broadcast()
+	s.mu.Unlock()
 }
 
 func (s *sched) wakeLocked() {

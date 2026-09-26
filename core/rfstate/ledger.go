@@ -86,8 +86,10 @@ type Ledger struct {
 	mask   uint32
 	touch  []touchSet
 
-	feeMu sync.Mutex
-	fees  []*uint256.Int
+	feeMu   sync.Mutex
+	fees    []*uint256.Int
+	feePre  []*uint256.Int // feePre[i] is the sum of fees[0:i] once that prefix is filled
+	feeFill int            // fees[0:feeFill] are all recorded
 
 	onInvalidate func(Victim)
 	learner      *Learner
@@ -115,9 +117,11 @@ func NewLedger(n int, learner *Learner, onInvalidate func(Victim)) *Ledger {
 		mask:         uint32(stripes - 1),
 		touch:        make([]touchSet, n),
 		fees:         make([]*uint256.Int, n),
+		feePre:       make([]*uint256.Int, n+1),
 		onInvalidate: onInvalidate,
 		learner:      learner,
 	}
+	l.feePre[0] = uint256.NewInt(0)
 	for i := range l.shards {
 		l.shards[i].keys = map[Key]*keyState{}
 	}
@@ -232,12 +236,18 @@ func (l *Ledger) Publish(tx int, k Key, data []byte, estimate bool, base []byte)
 	var victims []Victim
 	if !estimate {
 		for _, r := range ks.readers {
-			if r.tx <= tx || r.obsTx >= tx {
+			if r.tx <= tx || r.obsTx > tx {
 				continue
 			}
-			observed := base
-			if r.obsTx >= 0 {
+			// A reader that already observed this tx saw prev, which was
+			// replaced above. versionData would return the new bytes.
+			var observed []byte
+			if r.obsTx == tx {
+				observed = prev
+			} else if r.obsTx >= 0 {
 				observed = versionData(ks.vers, r.obsTx)
+			} else {
+				observed = base
 			}
 			if bytesEqual(observed, data) {
 				continue
@@ -434,6 +444,59 @@ func (l *Ledger) LowerProducer(tx int, k Key) (int, bool) {
 	return best, best >= 0
 }
 
+// ReadKeys returns the keys this attempt has registered as a reader.
+func (l *Ledger) ReadKeys(tx int) []Key {
+	if l == nil || tx < 0 || tx >= len(l.touch) {
+		return nil
+	}
+	reads := l.touch[tx].reads
+	if len(reads) == 0 {
+		return nil
+	}
+	out := make([]Key, 0, len(reads))
+	for k := range reads {
+		out = append(out, k)
+	}
+	return out
+}
+
+// RetractKey removes tx's version of one key and invalidates readers that
+// observed it. Used when an early publish is reverted inside the attempt.
+func (l *Ledger) RetractKey(tx int, k Key) {
+	if l == nil || tx < 0 {
+		return
+	}
+	ks := l.existing(k)
+	if ks == nil {
+		return
+	}
+	ks.mu.Lock()
+	had := false
+	dst := ks.vers[:0]
+	for _, v := range ks.vers {
+		if v.tx == tx {
+			had = true
+			continue
+		}
+		dst = append(dst, v)
+	}
+	ks.vers = dst
+	var victims []Victim
+	if had {
+		for _, r := range ks.readers {
+			if r.tx > tx && r.obsTx == tx {
+				victims = append(victims, Victim{Tx: r.tx, Attempt: r.attempt, Key: k})
+			}
+		}
+		dropProducer(ks, tx)
+	}
+	ks.mu.Unlock()
+	if had && tx < len(l.touch) {
+		delete(l.touch[tx].writes, k)
+	}
+	l.fire(k, victims)
+}
+
 func noteProducer(ks *keyState, tx int) {
 	for _, p := range ks.producers {
 		if p == tx {
@@ -454,24 +517,46 @@ func dropProducer(ks *keyState, tx int) {
 }
 
 // RecordFee stores the transaction-local coinbase fee. It is not a balance write.
+// A contiguous prefix sum is extended so a later SumFees of finalized lower
+// transactions does not scan the fee array.
 func (l *Ledger) RecordFee(tx int, fee *uint256.Int) {
 	l.feeMu.Lock()
 	defer l.feeMu.Unlock()
-	if fee == nil {
-		l.fees[tx] = uint256.NewInt(0)
+	if tx < 0 || tx >= len(l.fees) {
 		return
 	}
-	l.fees[tx] = new(uint256.Int).Set(fee)
+	if fee == nil {
+		l.fees[tx] = uint256.NewInt(0)
+	} else {
+		l.fees[tx] = new(uint256.Int).Set(fee)
+	}
+	// A re-execution can publish a different fee after later transactions
+	// have already extended the prefix. Sums at and above tx are stale.
+	if tx < l.feeFill {
+		l.feeFill = tx
+	}
+	for l.feeFill < len(l.fees) && l.fees[l.feeFill] != nil {
+		sum := new(uint256.Int).Set(l.feePre[l.feeFill])
+		sum.Add(sum, l.fees[l.feeFill])
+		l.feePre[l.feeFill+1] = sum
+		l.feeFill++
+	}
 }
 
 // SumFees returns the sum of recorded fees of transactions in [0, before).
 func (l *Ledger) SumFees(before int) *uint256.Int {
 	l.feeMu.Lock()
 	defer l.feeMu.Unlock()
-	sum := uint256.NewInt(0)
 	if before > len(l.fees) {
 		before = len(l.fees)
 	}
+	if before < 0 {
+		before = 0
+	}
+	if before <= l.feeFill {
+		return l.feePre[before]
+	}
+	sum := uint256.NewInt(0)
 	for i := 0; i < before; i++ {
 		if l.fees[i] != nil {
 			sum.Add(sum, l.fees[i])

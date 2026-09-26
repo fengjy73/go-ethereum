@@ -51,6 +51,12 @@ type Posterior struct {
 	Alpha     float64
 	Beta      float64
 	Conflicts uint64
+	// Single and Multi count how often a transaction wrote this key once
+	// versus more than once. Early publication is used only when a single
+	// write is the common case, so the value published mid-transaction is
+	// the one finish would have published.
+	Single uint64
+	Multi  uint64
 }
 
 // Learner holds per-key Beta posteriors. P0 decides greedily by comparing
@@ -144,6 +150,35 @@ func (l *Learner) ObserveConflict(k Key) {
 	l.anyFenced.Store(1)
 }
 
+// EarlyWrite reports that this key is fenced and its writes are usually final
+// on the first store, so publishing that store before transaction end is the
+// value later transactions should see.
+func (l *Learner) EarlyWrite(k Key) bool {
+	if l == nil || l.anyFenced.Load() == 0 {
+		return false
+	}
+	l.mu.Lock()
+	p, ok := l.post[k]
+	l.mu.Unlock()
+	return ok && p.Conflicts > 0 && p.Single > p.Multi
+}
+
+// ObserveWriteShape records whether one attempt wrote k once or several times.
+func (l *Learner) ObserveWriteShape(k Key, once bool) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	p := l.get(k)
+	if once {
+		p.Single++
+	} else {
+		p.Multi++
+	}
+	l.post[k] = p
+}
+
 // ObserveSafe records one PASS read that was still valid when the reader finalized.
 func (l *Learner) ObserveSafe(k Key) {
 	if l == nil {
@@ -154,6 +189,28 @@ func (l *Learner) ObserveSafe(k Key) {
 	p := l.get(k)
 	p.Beta++
 	l.post[k] = p
+}
+
+// ObserveSafeBatch records many safe reads under one lock.
+// Keys that have no stored posterior are skipped. A safe read must not
+// allocate a posterior for a cold key: only conflict evidence inserts one,
+// and only those keys can later choose WAIT_FINAL. Fenced keys already
+// in the map, including fast-forward reads that skipped the fence, still
+// gain beta.
+func (l *Learner) ObserveSafeBatch(keys []Key) {
+	if l == nil || len(keys) == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, k := range keys {
+		p, ok := l.post[k]
+		if !ok {
+			continue
+		}
+		p.Beta++
+		l.post[k] = p
+	}
 }
 
 // Decay fades excess counts by w/(w+1), where w is the prior's own weight
@@ -184,10 +241,12 @@ func (l *Learner) ApplyDelta(before, after *Learner) {
 	}
 	after.mu.Lock()
 	type delta struct {
-		k     Key
-		dA    float64
-		dB    float64
-		dConf uint64
+		k       Key
+		dA      float64
+		dB      float64
+		dConf   uint64
+		dSingle uint64
+		dMulti  uint64
 	}
 	var rows []delta
 	for k, got := range after.post {
@@ -201,14 +260,20 @@ func (l *Learner) ApplyDelta(before, after *Learner) {
 		}
 		dA := got.Alpha - base.Alpha
 		dB := got.Beta - base.Beta
-		var dConf uint64
+		var dConf, dSingle, dMulti uint64
 		if got.Conflicts > base.Conflicts {
 			dConf = got.Conflicts - base.Conflicts
 		}
-		if dA == 0 && dB == 0 && dConf == 0 {
+		if got.Single > base.Single {
+			dSingle = got.Single - base.Single
+		}
+		if got.Multi > base.Multi {
+			dMulti = got.Multi - base.Multi
+		}
+		if dA == 0 && dB == 0 && dConf == 0 && dSingle == 0 && dMulti == 0 {
 			continue
 		}
-		rows = append(rows, delta{k, dA, dB, dConf})
+		rows = append(rows, delta{k, dA, dB, dConf, dSingle, dMulti})
 	}
 	after.mu.Unlock()
 
@@ -219,6 +284,8 @@ func (l *Learner) ApplyDelta(before, after *Learner) {
 		p.Alpha += row.dA
 		p.Beta += row.dB
 		p.Conflicts += row.dConf
+		p.Single += row.dSingle
+		p.Multi += row.dMulti
 		l.post[row.k] = p
 		if p.Conflicts > 0 {
 			l.anyFenced.Store(1)

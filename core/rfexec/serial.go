@@ -51,6 +51,14 @@ type Outcome struct {
 	Store    *rfstate.Store
 	Counters Counters
 	Wall     time.Duration
+	// ActiveC is the worker count at the end of the run. Fixed engines
+	// leave it equal to the requested C. rf-auto reports the last trial.
+	ActiveC int
+	// CTrace is the sequence of chosen active counts, "4" or "1-2-4".
+	CTrace string
+	// CrewBest is the measured-best trial for the next block's rf-auto
+	// prior. Zero on fixed engines.
+	CrewBest int
 }
 
 // Counters are the per-run measurements written to the benchmark CSV.
@@ -114,6 +122,8 @@ func ExecSerial(env *BlockEnv) (*Outcome, error) {
 		Root:     root,
 		DB:       db,
 		Wall:     wall,
+		ActiveC:  1,
+		CTrace:   "1",
 	}, nil
 }
 
