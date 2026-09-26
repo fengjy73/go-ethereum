@@ -26,7 +26,7 @@
 3. **已完成** `core/rfexec`：夹具、串行、OCC、RegionFence、核对。
 4. **已完成** `cmd/rfbench` 与 README。
 5. **已完成** 单测、五块夹具 C=1,2,4,8、`go test -race`、`rfbench` CSV。golangci-lint 对新包 0 issues，`check_baddeps` 通过。
-6. **进行中** 提交、推送、PR。
+6. **已完成** 提交 `0ff2f1509` 已推送。草稿 PR：https://github.com/fengjy73/go-ethereum/pull/1
 
 ## 验证记录
 
