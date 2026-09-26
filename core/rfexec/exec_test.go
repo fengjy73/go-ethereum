@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -94,20 +95,51 @@ func TestFixtureEngines(t *testing.T) {
 	}
 }
 
+// fixtureDirs is RF_FIXTURES (comma or path-list separated) or the default
+// extracted trees: fixtures-a at /tmp/fixa and fixtures-b at /tmp/fixb.
+func fixtureDirs() []string {
+	if v := strings.TrimSpace(os.Getenv("RF_FIXTURES")); v != "" {
+		var dirs []string
+		for _, p := range strings.FieldsFunc(v, func(r rune) bool {
+			return r == ',' || r == os.PathListSeparator
+		}) {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				dirs = append(dirs, p)
+			}
+		}
+		return dirs
+	}
+	var dirs []string
+	for _, d := range []string{"/tmp/fixa", "/tmp/fixb"} {
+		if _, err := os.Stat(d); err == nil {
+			dirs = append(dirs, d)
+		}
+	}
+	return dirs
+}
+
 func loadFixtures(t *testing.T) []*BlockEnv {
 	t.Helper()
-	dir := os.Getenv("RF_FIXTURES")
-	if dir == "" {
-		dir = "/tmp/fixa"
-	}
-	if _, err := os.Stat(dir); err != nil {
+	dirs := fixtureDirs()
+	if len(dirs) == 0 {
 		return nil
 	}
-	blocks, err := LoadFixtures(dir)
+	blocks, err := LoadFixtures(dirs...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return blocks
+}
+
+func findBlockDir(number string) string {
+	for _, dir := range fixtureDirs() {
+		sub := filepath.Join(dir, number)
+		if _, err := os.Stat(filepath.Join(sub, "block.json.gz")); err == nil {
+			return sub
+		}
+	}
+	return ""
 }
 
 func syntheticEnv(t *testing.T) *BlockEnv {
@@ -185,12 +217,8 @@ func mustKey(t *testing.T) *ecdsa.PrivateKey {
 }
 
 func TestLoadFixtureShape(t *testing.T) {
-	dir := os.Getenv("RF_FIXTURES")
-	if dir == "" {
-		dir = "/tmp/fixa"
-	}
-	sub := filepath.Join(dir, "22411250")
-	if _, err := os.Stat(sub); err != nil {
+	sub := findBlockDir("22411250")
+	if sub == "" {
 		t.Skip("fixture not present")
 	}
 	env, err := LoadFixture(sub)
@@ -202,6 +230,34 @@ func TestLoadFixtureShape(t *testing.T) {
 	}
 	if len(env.Hashes) != 256 {
 		t.Fatalf("hashes %d", len(env.Hashes))
+	}
+	out, err := ExecSerial(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckFixture(env, out); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("serial %s gas %d", out.Wall, out.GasUsed)
+}
+
+func TestLoadPostPectraShape(t *testing.T) {
+	sub := findBlockDir("26060000")
+	if sub == "" {
+		t.Skip("post-pectra fixture not present")
+	}
+	env, err := LoadFixture(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Number != 26060000 || len(env.Txs) == 0 || len(env.Receipts) != len(env.Txs) {
+		t.Fatalf("loaded %+v txs %d receipts %d", env.Number, len(env.Txs), len(env.Receipts))
+	}
+	if env.Header.ParentBeaconRoot == nil || env.Header.RequestsHash == nil {
+		t.Fatal("post-pectra header missing beacon root or requests hash")
+	}
+	if !params.MainnetChainConfig.IsOsaka(env.Header.Number, env.Header.Time) {
+		t.Fatal("26060000 is not on the Osaka rules this tree uses")
 	}
 	out, err := ExecSerial(env)
 	if err != nil {

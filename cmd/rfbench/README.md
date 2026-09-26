@@ -37,6 +37,12 @@ first-seen account and slot in transaction order. System-contract code
 (EIP-4788 / 2935 / 7002 / 7251) is seeded from `params` when the fork is
 active and the tracer did not include it. Storage is not invented.
 
+Two archives use this layout. `fixtures-a` holds Cancun blocks 22018250,
+22102250, 22194250, 22411250, and 22418000. `fixtures-b` holds Cancun blocks
+19951808, 20058000, and 20361898, plus post-Pectra blocks 26060000 and
+26061000 (Osaka and BPO2 on mainnet). Tests read `/tmp/fixa` and `/tmp/fixb`
+when `RF_FIXTURES` is unset, and skip a tree that is not present.
+
 State is memory-only. The timed region is pre-execution, user transactions,
 post-execution, and withdrawals. Loading, state-root calculation, and trie
 commit are outside it. The Go KZG context (`kzg4844.UseCKZG(false)`) is
@@ -47,9 +53,9 @@ setup, not an engine warm-up. Engine state is still fresh on every timed run.
 ## Run
 
 ```sh
-# this VM (4 cores)
+# this VM (4 cores). Pass both fixture trees; they are sorted by block number.
 GOGC=100 ./rfbench \
-  -fixtures /path/to/fixa \
+  -fixtures /path/to/fixa,/path/to/fixb \
   -engines serial,occ,rf \
   -c 1,2,4,8 \
   -k 1 \
@@ -66,7 +72,7 @@ CPU list is empty.
 ```sh
 cpus=$(seq -s, 128 255)
 GOGC=100 GOMAXPROCS=128 ./rfbench \
-  -fixtures /path/to/fixtures \
+  -fixtures /path/to/fixa,/path/to/fixb \
   -engines serial,occ,rf \
   -c 1,2,4,8,16,32,64,128 \
   -k 3 \

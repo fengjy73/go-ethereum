@@ -14,8 +14,9 @@
 
 ## 完成标准
 
-- 五个夹具上 serial 与 receipts 一致。
+- fixtures-a 与 fixtures-b 共十个块上 serial 与 receipts 一致。
 - occ 与 rf 在 C=1,2,4,8 上最终状态与收据相对 serial 一致。
+- 其中 26060000、26061000 为 Osaka/BPO2。
 - `cmd/rfbench` 可输出 CSV。
 - 账本/围栏有单元测试；子集可跑 race。
 
@@ -32,3 +33,4 @@
 
 - `go test ./core/rfstate` 通过，含 `TestDropEstimatesRemovesUnpublishedKey`。
 - `RF_FIXTURES=/tmp/fixa go test ./core/rfexec -run 'TestFixtureEngines|TestSynthetic|TestLoad'` 通过（约 13s，KZG 预热前）。22418000 串行约 1.87s 来自首次 point-evaluation 的 KZG 初始化，已移到计时区外。
+- **2026-09-26 续** fixtures-b（19951808、20058000、20361898、26060000、26061000）并入 `TestFixtureEngines`。十块一次通过；`rfbench -fixtures /tmp/fixa,/tmp/fixb` 退出码 0。Osaka 系统调用沿用已有 Prague pre/post 路径，未改执行器。
