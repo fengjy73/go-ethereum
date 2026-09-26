@@ -130,6 +130,9 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		s.mu.Unlock()
 		limit := autoLimit(pool, procCap)
 		s.crew = newCrew(cost.Clone(), limit, env)
+		s.crew.setClock(func() (time.Time, int64) {
+			return time.Now(), procCPU()
+		})
 		workers = s.crew.begin(s.width)
 		// Arm before Drive so a worker cannot observe an unarmed gate.
 		// Drive's generation is the current value plus one; this coordinator
@@ -143,6 +146,9 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		defer gate.restore()
 	}
 	s.bindWorkers(pool.Width())
+	if s.crew != nil {
+		s.crew.startSegment()
+	}
 	gen := pool.Drive(workers, s.Step, s.Done)
 	if gate != nil {
 		gate.arm(gen)
@@ -188,18 +194,18 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		best = s.crew.Best()
 		_, modelC, modelPred, modelCurve = s.crew.Curve()
 		nextCost = s.crew.cost
-		ctr := s.counters()
-		var gasExec uint64
-		for _, r := range receipts {
-			gasExec += r.GasUsed
+		// The reported curve is the opening plan. Segments fold into the
+		// clone the next block will see, including an abandoned probe.
+		s.crew.closeSegments()
+		var segWall uint64
+		for _, seg := range s.crew.segments {
+			segWall += seg.WallNs
 		}
-		// The reported curve is the plan made before this block's wall
-		// sample. ObserveBlock updates the clone the next block will see.
-		fit := s.crew.realizedGas()
-		if fit <= 0 {
-			fit = s.crew.BodyGas()
+		wallNs := uint64(wall.Nanoseconds())
+		if wallNs > segWall {
+			nextCost.NoteRemainder(wallNs - segWall)
 		}
-		nextCost.ObserveBlock(best, uint64(wall.Nanoseconds()), gasExec, ctr.Executions, ctr.Rollbacks, fit, s.crew.limitSum)
+		nextCost.NoteUtil(float64(gas), s.crew.limitSum)
 	}
 	return &Outcome{
 		Receipts:   receipts,
@@ -815,6 +821,9 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 		}
 	}
 	gas := result.UsedGas
+	if s.crew != nil {
+		s.crew.noteIO(idx, s.ledger.ReadKeys(idx), view.WroteKeys())
+	}
 	applyN, doApply = s.crewSampleLocked(idx, gas, true)
 	s.wakeLocked()
 	s.cv.Broadcast()

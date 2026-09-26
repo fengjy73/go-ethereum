@@ -60,7 +60,7 @@
 4. **已完成** C=1 跳过 fence 和 abort 原子读；账户 wipe 只读一次；固定 C=1 的 `ObserveSafeBatch` 延到块末。`TxView` 本来就实现 `vm.StateDB`，没有适配层可删。
 5. **已完成（数字未达目标）** `TestFixtureEngines` 在最终策略后通过。`go test -race` 下 `core/rfstate` 1.0s、`core/rfexec` 88.8s，退出码 0。RF C=2 与 C=4 各 K=30、C=8 K=15 在最终策略之前的固定 C 路径上退出码 0（固定 C 不走 crew）。lint 0 issues，`check_baddeps` 通过，`make all` 退出码 0。本机 K=3、`GOMAXPROCS=C`、cpus 0-3 的第二次中位数：rf C=1 / serial 几何平均 1.35（更早一次同 C=1 代码、旧 crew 的几何平均是 1.275，stage 2 提交是 1.31；1.30 没有站住）。rf-auto reset / 每块最佳固定 rf C = 1.19，carry = 1.116，都没有进 10%。22418000 的 reset 从 1 起是 1.66，carry 从 4 起是 1.03。C=1 剖面采样 10ms，TxView / Ledger / sched 的 flat 都在一两格采样里，不能用来声称桶下降；ALLOC 相对 stage 2 剖面略高。
 
-## Stage 2c（进行中，待用户验收）
+## Stage 2c（已提交 `3f5b0bb48`，待用户验收）
 
 目标：先修 rf-auto 在收缩到 1 时漏掉 coinbase 费用的正确性；再用代价模型选 C，而不是用短窗 wall 爬坡。同一分支 / PR #1，基线 `c7c741970`。十块正确性与 race 保持通过。
 
@@ -71,9 +71,20 @@
 5. **已完成** `-pin-coordinator` 与 README 里的 ict21 命令。本机只有一个 L3 组，量不出跨 CCX 的 10%。
 6. **已完成代码与本机测量** 1000Hz 请求、24 遍的 C=1 剖面；固定 C=1 的冷读不再插入 keyState。压力：rf-auto K=30 两轮（reset/carry）各 300 行，rf C=2/4 K=30 各 300 行，C=8 K=15 共 150 行，逐次检查通过。race 见验证记录。ict21 的 1.39× 和 “CPU>2×” 没有在 ict21 上重测。
 
+## Stage 2d（代码已在本机测过，待用户验收）
+
+目标：按段记账并换掉「只探 2×」的策略，让 rf-auto 的预测包含跨发送者 RAW、固定开销和直接测到的膨胀。同一分支 / PR #1，基线 `3f5b0bb48`。十块正确性保持通过。ict21 上的数字以用户已测的 `3f5b0bb48` 为准，本机不能代替。
+
+1. **已完成** 每个活跃 C 的片段单独记 wall、进程 CPU 和实际 gas。放弃的探针记在它真正跑过的 C 上。尾部不更新速率。前沿窄于 C 的段只记 0.25 个样本，不改 rate。`TestAbandonedProbeUpdatesItsOwnC`、`TestTailSegmentDoesNotMoveRate`。
+2. **已完成** 开块用 `T*(1-0.35/sqrt(samples+1))`，而且只给真正缩短关键路径的 C 加探索奖励，纯链不会为了奖励跑到更宽的 C。检查点按后验均值重选。未测到的 C 膨胀保持 1，不从邻居抄一个被夹到 8 的值。`TestExploreNotStuckAtOne`、`TestTerribleInflationIsNotRepicked`。
+3. **已完成** 跨发送者 RAW 用收缩后的冲突率做成软链（最重的一笔加上 `p` 乘其余权重），不是把整份合约收成一条发送者链。选择器向 gas limit 收缩。C=1 的大段才写 base 和 infl。`TestHotContractLengthensCriticalPath`、`TestInBlockRAWChainsContract`、`TestSelectorShrinksTowardLimit`、`TestFixedCostOnTinyPrediction`。
+4. **已完成** 默认不 `LockOSThread`。当前线程只对第一组 L3 做亲和提示。`-pin-coordinator` 仍可用，并在 stderr 说明 `GOMAXPROCS=C` 时更慢。README 里固定引擎是 `GOMAXPROCS=C+1`，rf-auto 不用 +1。
+5. **未改解释器** 22102250 / 26061000 / 22018250 的 C=1 差距没有新的便宜热点。2c 对 26061000 的剖面里 `Ledger.Read` 已经没有了，剩下的是解释器、keccak、jumpdest。本机 K=3 的 rf C=1/serial 是 1.223、1.132、0.860，几何平均 1.137；这不是 ict21，也不是这次砍出来的。
+
 ## 验证记录
 
 - `go test ./core/rfstate` 通过，含 `TestDropEstimatesRemovesUnpublishedKey`。
 - `RF_FIXTURES=/tmp/fixa go test ./core/rfexec -run 'TestFixtureEngines|TestSynthetic|TestLoad'` 通过（约 13s，KZG 预热前）。22418000 串行约 1.87s 来自首次 point-evaluation 的 KZG 初始化，已移到计时区外。
 - **2026-09-26 续** fixtures-b（19951808、20058000、20361898、26060000、26061000）并入 `TestFixtureEngines`。十块一次通过；`rfbench -fixtures /tmp/fixa,/tmp/fixb` 退出码 0。Osaka 系统调用沿用已有 Prague pre/post 路径，未改执行器。
 - **2026-09-27 Stage 2c** `TestFixtureEngines` 7.2s 通过。`go test -race`：`core/rfstate` 1.0s，`core/rfexec` 86.3s，退出码 0。rf-auto reset/carry K=30 各 300 行，rf C=2/4 K=30 各 300 行，C=8 K=15 共 150 行，逐次对串行通过。本机 K=3 中位数几何平均 rf C=1/serial = 1.213（stage 2b 同机是 1.35；ict21 上一次是 1.39，这次没有上 ict21）。rf-auto reset 相对每块最佳固定 rf C（1/2/4）几何平均 1.02，10 块里 7 块在 10% 内；carry 1.09，5/10。第一块 `model_pred_ns` 为 0。lint 0 issues，`check_baddeps` 通过，`make all` 退出码 0。
+- **2026-09-27 Stage 2d** `go test ./core/rfstate ./core/rfexec` 通过（含十块 `TestFixtureEngines`）。`go test -race`：`core/rfstate` 1.0s，`core/rfexec` 81.4s，退出码 0。模型单测覆盖放弃的探针、尾段、探索、热点软链、选择器收缩和固定项。`model_pred_ns` 与开块曲线上 `model_c` 的 60 行全部一致。lint 0 issues，`check_baddeps` 通过。本机 4 核、K=3、`GOMAXPROCS=C`、cpus 为 `0..C-1`、没有 `-pin-coordinator`。相对 serial 的中位数几何平均：occ 1/2/4 = 1.201/0.939/0.903，rf 1/2/4 = 1.137/0.993/0.940，rf-auto reset 1.016，carry 0.927。相对每块最佳固定 rf C：reset 几何平均 1.139（5/10 在 10% 内），carry 1.039（8/10）。预测对 wall 的块中位误差中位数：reset -5%，carry -21%；20361898 仍约 -70%（它排在学会固定项之前），22018250 carry +65%。没有上 ict21。

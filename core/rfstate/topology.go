@@ -38,6 +38,28 @@ import (
 // 136-143) is rewritten so the whole first cache comes before the spill.
 // If sysfs is missing for any CPU, the input order is returned and groups
 // is nil; the harness then pins worker i to the caller's i-th CPU.
+// FirstCacheCPUs returns the CPUs of the first last-level cache group in
+// LayoutCPUs order. An empty result means sysfs did not identify a group.
+func FirstCacheCPUs(cpus []int) []int {
+	ordered, _, ok := layoutCPUs(cpus, readCacheGroup)
+	if !ok || len(ordered) == 0 {
+		return nil
+	}
+	first, ok := readCacheGroup(ordered[0])
+	if !ok || first == "" {
+		return nil
+	}
+	out := make([]int, 0, 8)
+	for _, cpu := range ordered {
+		g, ok := readCacheGroup(cpu)
+		if !ok || g != first {
+			break
+		}
+		out = append(out, cpu)
+	}
+	return out
+}
+
 func LayoutCPUs(cpus []int) (ordered []int, groups []string) {
 	ordered, groups, _ = layoutCPUs(cpus, readCacheGroup)
 	return ordered, groups

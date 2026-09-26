@@ -220,10 +220,30 @@ func pinThread(cpu int) error {
 	return unix.SchedSetaffinity(unix.Gettid(), &set)
 }
 
+// HintCurrentThread asks the OS to run the current thread on cpus. It does
+// not lock the goroutine to that thread, so a later schedule can move it.
+// rfbench uses this as a hint that the coordinator float inside the first
+// last-level cache. The measured regression is LockOSThread onto one CPU.
+func HintCurrentThread(cpus []int) error {
+	if len(cpus) == 0 {
+		return nil
+	}
+	var set unix.CPUSet
+	set.Zero()
+	for _, cpu := range cpus {
+		if cpu < 0 {
+			return fmt.Errorf("negative cpu %d", cpu)
+		}
+		set.Set(cpu)
+	}
+	return unix.SchedSetaffinity(unix.Gettid(), &set)
+}
+
 // PinCurrentThread locks the calling goroutine to its OS thread and pins
-// that thread to cpu. The lock is held for the life of the goroutine: the
-// caller should not UnlockOSThread. Workers must be pinned to other CPUs
-// in the same last-level cache so the coordinator is not on a worker's CPU.
+// that thread to one cpu. The lock is held for the life of the goroutine.
+// -pin-coordinator uses this. On a host with GOMAXPROCS equal to the worker
+// count it was slower than leaving the coordinator unpinned in the same
+// last-level cache, because the locked thread occupies one of the C Ps.
 func PinCurrentThread(cpu int) error {
 	runtime.LockOSThread()
 	if err := pinThread(cpu); err != nil {

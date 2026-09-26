@@ -70,19 +70,27 @@ GOGC=100 ./rfbench \
 ```
 
 256-core host, pinned to CPUs 128-255. Run **one process per engine and
-C**, with `GOMAXPROCS=C`. The CPU list is only the pin mask: it does not
-raise `GOMAXPROCS` or the number of worker threads. If `GOMAXPROCS` is unset,
-the process sets it once to the largest `-c` value. Fixed engines leave that
-cap in place. `rf-auto` is one process whose cap is the worker pin list
-when the variable is unset. During the block the coordinator loop tracks
-`GOMAXPROCS` to the active count and restores the cap before the run
-returns. Inactive workers wait on the pool condition.
+C**. The CPU list is only the pin mask: it does not raise `GOMAXPROCS` or
+the number of worker threads. If `GOMAXPROCS` is unset, the process sets it
+once to the largest `-c` value (for `rf-auto`, to the worker pin list).
+Fixed engines should set `GOMAXPROCS=C+1` so the coordinator has a P that
+is not one of the pinned workers. `rf-auto` must not use that +1: its cap
+is `min(pin list, GOMAXPROCS)`, and an extra P would wake an extra worker.
+During an auto block the coordinator loop tracks `GOMAXPROCS` to the active
+count and restores the cap before the run returns. Inactive workers wait
+on the pool condition.
 
-`-pin-coordinator` locks the main goroutine to the first CPU of the first
-last-level cache and starts workers on the rest of the ordered list. On
-ict21 that keeps the coordinator in the workers' CCX. Recommended command,
-with `GOMAXPROCS` unset so the cap is the worker list (127 CPUs after the
-coordinator takes one):
+The default does **not** call `LockOSThread` on the coordinator. It asks
+the OS to prefer the current thread on the first last-level cache, and the
+goroutine is free to migrate inside that set. `-pin-coordinator` is
+optional. It locks the main goroutine to the first CPU of that cache and
+starts workers on the rest. On ict21, with `GOMAXPROCS=C`, that lock was
+slower than an unpinned coordinator floating in the same CCX: fixed rf
+C=4 about 22%, C=8 about 11%, occ C=4 about 25%. `GOMAXPROCS=C+1` recovered
+C=4 and did not recover C=8. Leave the flag off unless you are measuring
+that placement.
+
+`rf-auto`, one process, `GOMAXPROCS` unset so the cap is the pin list:
 
 ```sh
 cpus=$(seq -s, 128 255)
@@ -91,11 +99,14 @@ GOGC=100 ./rfbench \
   -engines rf-auto \
   -k 10 \
   -cpus "$cpus" \
-  -pin-coordinator \
   -prior carry \
   -gogc 100 \
-  -out results-rf-auto.csv
+  -out results-rf-auto-carry.csv
 ```
+
+The same command with `-prior reset` clears the per-key Beta learner. The
+worker-count model is carried either way. Run a second process with
+`-out results-rf-auto-reset.csv` when the comparison needs a cold Beta prior.
 
 The pin list is compacted by last-level cache before workers start. The
 group key is `shared_cpu_list` of the highest-index cache under
@@ -117,7 +128,8 @@ for eng in serial occ rf; do
     if [ "$eng" = serial ] && [ "$c" != 1 ]; then
       continue
     fi
-    GOMAXPROCS=$c GOGC=100 ./rfbench \
+    # C+1 leaves the coordinator a P. Do not pass -pin-coordinator.
+    GOMAXPROCS=$((c + 1)) GOGC=100 ./rfbench \
       -fixtures /path/to/fixa,/path/to/fixb \
       -engines "$eng" \
       -c "$c" \
@@ -167,55 +179,69 @@ changes, and `ExecAuto` restores the cap before it returns. A deferred
 update carries the `Drive` generation and is ignored once the next block
 has started.
 
-The count is `argmin T(C)`, not a hill climb on a short wall window.
+The count minimises
 
 ```
-T(C) = max(CP, Work/C) * (1 + r(C)) * rate(C)
+T(C) = fixedNs*infl(C) + nTx*txFixed*infl(C) + max(CP, Work/C)*(1+r(C))*base*infl(C)
 ```
 
-`CP` is the longest same-sender chain still ahead of the frontier. `Work`
-is the sum of per-transaction weights. A weight is the learned gas for
-that contract and 4-byte selector, else the running mean gas, else the
-transaction gas limit. In-block, a finished attempt replaces its weight
-with the gas it used. `r(C)` is the learned re-execution rate
-(rollbacks/executions); an in-block rate replaces it when higher.
-`rate(C)` is wall nanoseconds per gas-equivalent `L(C) = max(CP, Work/C) * (1+r)`
-measured on previous blocks, before inflation. The sample uses the gas the
-block actually burned, and the next block estimates unknown transactions as
-gas-limit times the learned actual-to-limit ratio, so the two stay on one
-scale. `infl(C) = rate(C) / rate(smallest measured C)`.
-A sample is clamped to `[0.25, 8]` times the reference rate. Wall time
-inside the block does not rank `C`. It only updates `rate` and `r` after
-the block, on the body choice.
+over every integer `C` from 1 to the smoothed frontier, capped by the
+process limit. Until `base` is known, `T` is the gas-equivalent
+`max(CP, Work/C)*(1+r)` and `model_pred_ns` is 0.
 
-A cold model has no rates. Every `C` up to the smoothed frontier is
-eligible and inflation is 1, so the first block takes the widest plan.
-After any `C` is measured, an unmeasured `C` is ineligible except for one
-probe at the start of the block: half the best measured `C` if that half
-is unmeasured, otherwise double it, clamped to the width and the limit.
-The probe stays for the body. Checkpoints do not abandon it.
+`CP` is the longest chain still ahead of the frontier. Same-sender edges
+come from the nonce order. A contract with cross-sender read-after-write
+adds a soft chain: its heaviest transaction plus
+`conflicts / (seen + 8)` times the rest of its weight, after at least four
+transactions and only when that rate exceeds 0.25. Unseen contracts add
+nothing, and the rate does not turn the whole contract into one sender chain.
+`Work` is the sum of per-transaction weights. A weight is the selector's
+observed mean gas shrunk toward the gas-limit prior,
+`(4*prior + n*mean) / (4+n)`, else the gas limit times the learned
+actual-to-limit ratio. One observation does not replace the limit.
+`r(C)` is the learned re-execution rate. `base` is process CPU nanoseconds
+per gas at C=1. `infl(C)` is CPU-per-gas at that C divided by `base`,
+clamped to `[0.25, 8]`. It is not `rate(C)/rate(1)`: that ratio mixes a
+parallelism mistake into the slowdown. `fixedNs` and `txFixed` are the
+C=1 wall that `base*gas` does not explain, plus time outside the segments.
 
-The plan is recomputed at completions `n/4`, `n/2`, and `3n/4` when
-`n >= 8`, or at `n/2` when `2 <= n < 8`. A checkpoint stays on the
-incumbent unless another measured `C` is more than 5% better. The frontier
-width is an EWMA with alpha 0.25. The integer cap moves only when the
-average is a full worker away from the cap, so a 1-vs-2 flap on successive
-scheduling events does not move it. When more than two transactions remain
-in the block and at most two are left ahead of the frontier, the active
-count may shrink to the smoothed cap. That tail drain does not change
-`CrewBest`, and it is not the sample the next block learns from.
+Each time the active count changes, the wall, CPU, and gas of the segment
+that just ended are attributed to the C that was actually running. An
+abandoned probe updates `rate(C)` and `infl(C)` for that probe. A tail
+segment, and a body segment whose frontier width was below C, do not move
+`rate(C)`. The narrow body segment still takes a fractional sample so the
+next block does not open the same unmeasured probe. A short segment
+(under 200k gas) moves the EMA by `gas/(gas+500k)` and adds 0.25 of a
+sample; a longer one adds a full sample.
 
-`-prior reset` clears only the per-key Beta learner. The cost model is a
-property of the machine and is carried across blocks either way. Each of
-the K runs clones the pre-block model. After the block the model is the
-last run's, including that run's wall sample.
+The opening choice minimises `T(C) * (1 - 0.35/sqrt(samples(C)+1))`.
+Unmeasured C stay eligible, so the first block's choice cannot be the only
+C that is ever sampled. That opening value is the one exploration for the
+block. It is held until the first completion checkpoint even if the width
+EWMA dips, unless the live frontier drops below C, in which case the
+segment is closed and the count drops. The checkpoint folds the segment
+into the model and re-picks by the posterior mean, staying on the
+incumbent unless another C is more than 5% better. Checkpoints are
+completions `n/4`, `n/2`, and `3n/4` when `n >= 8`, or `n/2` when
+`2 <= n < 8`. The frontier width is an EWMA with alpha 0.25. The integer
+cap moves only when the average is a full worker away from the cap. When
+more than two transactions remain in the block and at most two are left
+ahead of the frontier, the active count may shrink. That tail does not
+change `CrewBest` and is not a rate sample.
 
-`model_c` is the body choice. `model_pred_ns` is the opening full-block
-`T(model_c)` in nanoseconds, or 0 when the model has no rate yet (the
-curve is then in gas-equivalents). It is not refit to this block's wall.
-`model_curve` is `ns:` or `gas:` followed by `c=v` pairs for that same
-opening plan, so `model_pred_ns` is the pair for `model_c` when that C
-was scored up front.
+If `base` was seeded from a C other than 1, the next block's one explore
+is C=1 so inflation can be rescaled onto the serial clock.
+
+`-prior reset` clears only the per-key Beta learner. The cost model is
+carried across blocks either way. Each of the K runs clones the pre-block
+model. After the block the model is the last run's.
+
+`model_c` is the body choice at the end of the run (the opening choice,
+unless a checkpoint abandoned it). `model_pred_ns` is the opening
+full-block `T` for that C in nanoseconds, or 0 when the opening plan had
+no `base` yet. It is not refit to this block's wall. `model_curve` is
+`ns:` or `gas:` followed by `c=v` pairs for that same opening plan, so
+`model_pred_ns` is the pair for `model_c` when that C was scored up front.
 
 Early publication of a storage slot or nonce runs only when the block is
 not statically single-worker and the key is fenced with more single-write
@@ -288,11 +314,11 @@ nonce or estimate miss parks on the lower transaction.
   Abandoned attempts retract the early version; there is no separate
   cascade for values derived from it beyond that invalidation.
 - No ORDER hand-off.
-- Learned C is the v0 list-scheduling model above: critical path, work,
-  a learned per-C rate, and a learned re-execution rate. It is not a
-  per-transaction simulator. Tail drain does not become the next block's
-  prior. The first block of a process has no rate, so its `model_pred_ns`
-  is 0.
+- Learned C is the list-scheduling model above: critical path (including
+  a hot-contract RAW chain), work, a C=1 baseline, a per-C CPU inflation,
+  a fixed overhead, and a re-execution rate. It is not a per-transaction
+  simulator. Tail drain does not become the next block's prior. The first
+  block of a process has no baseline, so its `model_pred_ns` is 0.
 - Rollback restarts the transaction and fast-forwards by read sequence.
   Fast-forward skips waits; it still re-registers readers. Interpreter
   frames are not restored from the snapshot.

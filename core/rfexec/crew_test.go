@@ -19,8 +19,10 @@ package rfexec
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rfstate"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
@@ -55,17 +57,18 @@ func TestModelChainPrefersOne(t *testing.T) {
 func TestModelRatePrefersCheaper(t *testing.T) {
 	prev := []int{-1, -1, -1, -1}
 	cost := NewCostPrior()
-	// Every feasible C has a sample, so this block does not probe.
-	// C=4 has been much slower per gas-equivalent than C=1.
-	cost.rate[1] = 1
-	cost.rate[2] = 4
-	cost.rate[3] = 6
-	cost.rate[4] = 8
-	cost.samples[1] = 1
-	cost.samples[2] = 1
-	cost.samples[3] = 1
-	cost.samples[4] = 1
-	cost.deriveInfl()
+	// Every feasible C has a sample. C=4's CPU inflation makes it slower
+	// than one worker even after the work is split.
+	cost.base = 1
+	cost.refC = 1
+	cost.infl[1] = 1
+	cost.infl[2] = 4
+	cost.infl[3] = 6
+	cost.infl[4] = 8
+	cost.samples[1] = 4
+	cost.samples[2] = 4
+	cost.samples[3] = 4
+	cost.samples[4] = 4
 	c := newCrew(cost, 4, chainEnv(4, prev, 100000))
 	if got := c.begin(4); got != 1 {
 		t.Fatalf("inflated C=4 chosen %d infl %v", got, cost.infl)
@@ -111,50 +114,207 @@ func TestModelTailKeepsBest(t *testing.T) {
 	}
 }
 
-func TestModelProbeThenSettle(t *testing.T) {
-	prev := []int{-1, -1, -1, -1}
-	env := chainEnv(4, prev, 100000)
-	cost := NewCostPrior()
-	c := newCrew(cost, 4, env)
-	c.begin(4)
-	// Record a wall sample as if C=4 took 4x the ideal time of one worker.
-	cost.ObserveBlock(c.Best(), 4000, 400000, 4, 0, c.BodyGas(), 0)
-	c2 := newCrew(cost, 4, env)
-	got := c2.begin(4)
-	if got != 2 {
-		t.Fatalf("expected a downward probe, got %d", got)
-	}
-	cost.ObserveBlock(c2.Best(), 2000, 400000, 4, 0, c2.BodyGas(), 0)
-	c3 := newCrew(cost, 4, env)
-	got = c3.begin(4)
-	if got != 1 {
-		t.Fatalf("expected probe to 1, got %d", got)
-	}
-	cost.ObserveBlock(1, 1000, 400000, 4, 0, c3.BodyGas(), 0)
-	c4 := newCrew(cost, 4, env)
-	got = c4.begin(4)
-	// C=1 wall was 1000 for the whole work. C=2 was 2000. C=4 was 4000.
-	// The ideal split would favour 1 because the larger counts were slower
-	// than the split predicts... rate = wall/L. L(4) is about work/4, so
-	// rate[4] = 4000 / (work/4) = 16000/work. rate[1] = 1000/work.
-	// T(4)=L(4)*rate[4]=4000, T(1)=L(1)*rate[1]=1000. Choose 1.
-	if got != 1 {
-		t.Fatalf("settled on %d, want 1", got)
-	}
-	if math.Abs(cost.inflation(4)-16) > 1 && cost.inflation(4) < 2 {
-		t.Fatalf("infl(4)=%v, want a clear slowdown", cost.inflation(4))
-	}
-}
-
 func TestObserveBlockDerivesInflation(t *testing.T) {
 	c := NewCostPrior()
-	c.ObserveBlock(1, 1000, 100, 1, 0, 100, 0)
-	c.ObserveBlock(4, 2000, 100, 1, 0, 25, 0)
-	// rate[1]=1000/100=10, rate[4]=2000/25=80, infl[4]=8.
-	if math.Abs(c.inflation(4)-8) > 0.01 {
-		t.Fatalf("infl(4)=%v", c.inflation(4))
+	// CPU is the wall for this helper. infl(C) is CPU-per-gas over the C=1 baseline.
+	// Gas is at the saturation floor. A shorter segment must not move inflation.
+	c.ObserveBlock(1, 5_000_000, 500_000, 4, 0, 0, 0)
+	c.ObserveBlock(4, 10_000_000, 500_000, 4, 0, 0, 0)
+	if math.Abs(c.inflation(4)-2) > 0.01 {
+		t.Fatalf("infl(4)=%v, want 2", c.inflation(4))
 	}
 	if math.Abs(c.inflation(1)-1) > 0.01 {
 		t.Fatalf("infl(1)=%v", c.inflation(1))
 	}
+	if c.rate[4] <= 0 {
+		t.Fatalf("rate(4) was not recorded")
+	}
 }
+
+func TestTailSegmentDoesNotMoveRate(t *testing.T) {
+	c := NewCostPrior()
+	c.ObserveSegments([]Segment{{
+		C: 1, WallNs: 2_000_000, CPUNs: 2_000_000, Gas: 1_000_000, Execs: 4, Width: 1,
+	}})
+	body := c.rate[1]
+	if body <= 0 {
+		t.Fatalf("body rate %v", body)
+	}
+	c.ObserveSegments([]Segment{{
+		C: 1, WallNs: 50_000_000, CPUNs: 50_000_000, Gas: 1_000_000, Execs: 2, Width: 1, Tail: true,
+	}})
+	if c.rate[1] != body {
+		t.Fatalf("tail moved rate(1) from %v to %v", body, c.rate[1])
+	}
+}
+
+func TestAbandonedProbeUpdatesItsOwnC(t *testing.T) {
+	cost := NewCostPrior()
+	cost.ObserveSegments([]Segment{{
+		C: 1, WallNs: 2_000_000, CPUNs: 2_000_000, Gas: 1_000_000, Execs: 4, Width: 1,
+	}})
+	// Four independent transactions, cap 4. n/2 is the first checkpoint.
+	// C=4's structural split is 4x, so an inflation above ~4.2 loses to C=1
+	// by more than the 5% stickiness and the probe is abandoned.
+	prev := []int{-1, -1, -1, -1}
+	env := chainEnv(4, prev, 100000)
+	c := newCrew(cost, 4, env)
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	c.setClock(clk.now)
+	if got := c.begin(4); got <= 1 {
+		t.Fatalf("opening %d, want a wider explore than the measured C=1", got)
+	}
+	probed := c.Active()
+	c.startSegment()
+	clk.t = clk.t.Add(3 * time.Millisecond)
+	clk.cpu += 3_000_000
+	if _, ch := c.observe(0, 0, 4, 250000, true, 0); ch {
+		t.Fatalf("first completion changed C before the checkpoint, trace %s", c.Trace())
+	}
+	clk.t = clk.t.Add(3 * time.Millisecond)
+	clk.cpu += 3_000_000
+	if _, _ = c.observe(1, 1, 4, 250000, true, 0); c.Active() == probed {
+		t.Fatalf("probe C=%d was not abandoned after its segment, trace %s infl %v", probed, c.Trace(), cost.infl)
+	}
+	if cost.rate[probed] <= 0 || cost.samples[probed] < 1 {
+		t.Fatalf("abandoned C=%d rate %v samples %v", probed, cost.rate[probed], cost.samples[probed])
+	}
+	// The same probe is not the opening choice of the next block.
+	c2 := newCrew(cost, 4, env)
+	if got := c2.begin(4); got == probed && cost.inflation(probed) >= 4 {
+		t.Fatalf("retried inflated C=%d", got)
+	}
+}
+
+func TestExploreNotStuckAtOne(t *testing.T) {
+	cost := NewCostPrior()
+	cost.base = 5
+	cost.refC = 1
+	cost.samples[1] = 2
+	cost.rate[1] = 5
+	prev := []int{-1, -1, -1, -1, -1, -1, -1, -1}
+	c := newCrew(cost, 8, chainEnv(8, prev, 100000))
+	got := c.begin(8)
+	if got <= 1 {
+		t.Fatalf("parallel cap 8 stayed at %d after only C=1 was measured", got)
+	}
+}
+
+func TestTerribleInflationIsNotRepicked(t *testing.T) {
+	cost := NewCostPrior()
+	cost.base = 1
+	cost.refC = 1
+	cost.infl[4] = 8
+	cost.samples[1] = 3
+	cost.samples[4] = 3
+	cost.rate[1] = 1
+	cost.rate[4] = 8
+	prev := []int{-1, -1, -1, -1}
+	for i := 0; i < 3; i++ {
+		c := newCrew(cost, 4, chainEnv(4, prev, 100000))
+		if got := c.begin(4); got == 4 {
+			t.Fatalf("block %d repicked C=4", i)
+		}
+	}
+}
+
+func TestHotContractLengthensCriticalPath(t *testing.T) {
+	prev := []int{-1, -1, -1, -1}
+	env := chainEnv(4, prev, 100000)
+	cold := newCrew(NewCostPrior(), 4, env)
+	cold.seedWeights()
+	cpCold, work := cold.path(0)
+	cost := NewCostPrior()
+	cost.hot[common.Address{}] = hotStat{conflicts: 8, seen: 8}
+	hot := newCrew(cost, 4, env)
+	hot.seedWeights()
+	cpHot, workHot := hot.path(0)
+	if cpCold > work/2 {
+		t.Fatalf("cold cp %v is already a chain (work %v)", cpCold, work)
+	}
+	// p = 8/(8+8) = 0.5, so the soft chain is about half the work, not all of it.
+	if cpHot < workHot*0.5 || cpHot > workHot*0.9 {
+		t.Fatalf("hot cp %v, work %v", cpHot, workHot)
+	}
+}
+
+func TestInBlockRAWChainsContract(t *testing.T) {
+	env := chainEnv(6, []int{-1, -1, -1, -1, -1, -1}, 100000)
+	env.Senders = []common.Address{{1}, {2}, {3}, {4}, {5}, {6}}
+	c := newCrew(NewCostPrior(), 4, env)
+	c.seedWeights()
+	slot := rfstate.SlotKeyOf(common.Address{}, common.Hash{9})
+	c.noteIO(0, nil, []rfstate.Key{slot})
+	cp0, _ := c.path(0)
+	// One cross-sender edge is not enough: the prior shrinks toward no conflict.
+	c.noteIO(1, []rfstate.Key{slot}, []rfstate.Key{slot})
+	cpOne, _ := c.path(0)
+	if cpOne > cp0*1.5 {
+		t.Fatalf("one RAW chained the contract, cp %v before %v", cpOne, cp0)
+	}
+	for i := 2; i < 5; i++ {
+		c.noteIO(i, []rfstate.Key{slot}, []rfstate.Key{slot})
+	}
+	cp, work := c.path(0)
+	// Four conflicts on five observations, shrunk by 8, is a partial chain.
+	if cp < cp0*2 || cp > work*0.9 {
+		t.Fatalf("after repeated RAW, cp %v work %v (before %v)", cp, work, cp0)
+	}
+	same := newCrew(NewCostPrior(), 4, env)
+	same.senders = []common.Address{{1}, {1}, {1}, {1}, {1}, {1}}
+	same.seedWeights()
+	for i := 0; i < 5; i++ {
+		var reads []rfstate.Key
+		if i > 0 {
+			reads = []rfstate.Key{slot}
+		}
+		same.noteIO(i, reads, []rfstate.Key{slot})
+	}
+	cpSame, workSame := same.path(0)
+	if cpSame > workSame/2 {
+		t.Fatalf("same-sender RAW chained the contract, cp %v work %v", cpSame, workSame)
+	}
+}
+
+func TestSelectorShrinksTowardLimit(t *testing.T) {
+	c := newCrew(NewCostPrior(), 1, chainEnv(1, []int{-1}, 100000))
+	c.seedWeights()
+	before := c.priorWeight(0)
+	c.learnSel(0, 10000)
+	after := c.priorWeight(0)
+	// (4*100000 + 10000) / 5 = 82000. One observation must not become 10000.
+	if after < 70000 || after > 90000 {
+		t.Fatalf("shrunk weight %v, before %v", after, before)
+	}
+	if math.Abs(after-10000) < 1 {
+		t.Fatalf("selector observation replaced the gas limit")
+	}
+}
+
+func TestFixedCostOnTinyPrediction(t *testing.T) {
+	cost := NewCostPrior()
+	cost.base = 10
+	cost.refC = 1
+	cost.fixedNs = 5_000_000
+	cost.samples[1] = 2
+	prev := []int{-1, 0, 1, 2}
+	c := newCrew(cost, 4, chainEnv(4, prev, 21000))
+	if got := c.begin(4); got != 1 {
+		t.Fatalf("chain choice %d", got)
+	}
+	_, chosen, pred, text := c.Curve()
+	if chosen != 1 || pred < 5_000_000 {
+		t.Fatalf("pred %d curve %s", pred, text)
+	}
+	// The gas term alone is about 4*21000*10. The fixed term has to be visible.
+	if pred < int64(cost.fixedNs)+800_000 {
+		t.Fatalf("pred %d did not include both fixedNs and gas", pred)
+	}
+}
+
+type fakeClock struct {
+	t   time.Time
+	cpu int64
+}
+
+func (f *fakeClock) now() (time.Time, int64) { return f.t, f.cpu }
