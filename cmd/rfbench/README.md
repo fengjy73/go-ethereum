@@ -1,0 +1,154 @@
+# rfbench
+
+RegionFence P0 and the benchmark harness. This is research code. The serial
+block processor and the EIP-7928 parallel processor are unchanged.
+
+## Base
+
+The branch is cut from go-ethereum `master`, not from the latest release tag.
+The pull request target is `master`, and `master` already carries Cancun,
+Prague, and Osaka in `MainnetChainConfig`, plus the `vm.StateDB` methods the
+prototype implements. A tag base would either miss post-Pectra blocks or show
+up in the pull request as an unrelated tree of upstream commits.
+
+## Build
+
+```sh
+go build -o rfbench ./cmd/rfbench
+```
+
+Go 1.25.0 is what this tree declares. `golang.org/x/sys` is already a
+dependency and is used for `SchedSetaffinity`.
+
+## Fixture format
+
+Each block is a directory of gzipped JSON produced by `uploads/rpcdump.py`
+(the RPC URL comes from `ETH_RPC_URL`; this tool does not dial a node):
+
+| file | source |
+| --- | --- |
+| `block.json.gz` | `eth_getBlockByNumber` with full transactions |
+| `prestate.json.gz` | `debug_traceBlockByNumber` prestateTracer, one entry per transaction |
+| `receipts.json.gz` | `eth_getBlockReceipts` |
+| `blockhashes.json.gz` | 256 ancestor hashes, decimal block number to hash |
+
+The block pre-state is the union of per-transaction prestates, keeping the
+first-seen account and slot in transaction order. System-contract code
+(EIP-4788 / 2935 / 7002 / 7251) is seeded from `params` when the fork is
+active and the tracer did not include it. Storage is not invented.
+
+State is memory-only. The timed region is pre-execution, user transactions,
+post-execution, and withdrawals. Loading, state-root calculation, and trie
+commit are outside it. The Go KZG context (`kzg4844.UseCKZG(false)`) is
+initialized before the timer: the first point-evaluation precompile otherwise
+spends about two seconds inside whichever run touches it. That is library
+setup, not an engine warm-up. Engine state is still fresh on every timed run.
+
+## Run
+
+```sh
+# this VM (4 cores)
+GOGC=100 ./rfbench \
+  -fixtures /path/to/fixa \
+  -engines serial,occ,rf \
+  -c 1,2,4,8 \
+  -k 1 \
+  -cpus 0,1,2,3 \
+  -prior reset \
+  -gogc 100 \
+  -out results.csv
+```
+
+256-core host, pinned to CPUs 128-255. `GOMAXPROCS` is set by the process to
+the larger of the worker count, the CPU list, and `runtime.NumCPU` when the
+CPU list is empty.
+
+```sh
+cpus=$(seq -s, 128 255)
+GOGC=100 GOMAXPROCS=128 ./rfbench \
+  -fixtures /path/to/fixtures \
+  -engines serial,occ,rf \
+  -c 1,2,4,8,16,32,64,128 \
+  -k 3 \
+  -cpus "$cpus" \
+  -prior carry \
+  -gogc 100 \
+  -out results.csv
+```
+
+There is no warm-up. Each timed run uses a fresh state and ledger.
+
+### Prior
+
+Blocks are sorted by number.
+
+- `reset`: every timed run starts from an empty per-key Beta prior.
+- `carry`: the prior for block N is produced by one untimed RegionFence pass
+  over the fixture blocks strictly below N, then cloned for each of the K
+  timed runs. In-block updates during a timed run are discarded, so run K
+  does not see run K-1. A single-block command has no earlier block, so the
+  prior is empty even in `carry` mode.
+
+The P0 rule is greedy: a key is fenced after its first invalidation, and
+`WAIT_FINAL` is chosen when a lower producer exists and the posterior mean
+exceeds 1/2. The cold prior is Beta(1, 32). Nothing is injected from a
+global hot set.
+
+### CSV
+
+`block, engine, C, run, wall_ns, executions, rollbacks, invalidations, wait_final, wait_prefix, wait_defer, wait_order, wait_ns, idle_ns, gc_pause_ns`
+
+`serial` is recorded once per run with `C=1`. `wait_ns` and `idle_ns` are
+sums across workers. `wait_order` is reserved for the later ORDER fence and
+stays zero in P0. Estimate waits in the OCC baseline are counted under
+`wait_final`. After every run the final accounts, storage, code, nonces,
+balances, and receipts are compared to the serial oracle. A mismatch exits
+non-zero.
+
+## Design to code
+
+| design | code |
+| --- | --- |
+| multi-version ledger, reader registry, writer push | `core/rfstate/ledger.go` |
+| `vm.StateDB` over the ledger, interpreter unchanged | `core/rfstate/txview.go` |
+| PASS / WAIT_FINAL / WAIT_PREFIX | `TxView.fence` |
+| DEFER_TX for same-sender nonce chains | `sched.pickLocked` |
+| cooperative yield (no busy-wait, no pinned-thread block) | `Signal` panic, recovered in `sched.execute` |
+| AT_FINISH publish, P0 restart + fast-forward | `TxView.Publish`, `ffUntil` |
+| coinbase fee recorded per transaction; prefix wait only on a real balance read | `addCoinbaseFee`, `Ledger.RecordFee`, `Fold` |
+| per-key Beta, greedy P0 rule | `core/rfstate/learner.go` |
+| fixed C, pool can change C, pinned persistent workers | `core/rfstate/pool.go` |
+| frontier termination (no lone tail) | `sched.tryAdvanceLocked`, `Pool` stays until `Done` |
+| Block-STM OCC baseline on the same plumbing | `sched` in `ModeOCC` |
+| serial oracle | `ExecSerial` via `ApplyTransactionWithEVM` |
+| ProcessRegionFence beside the existing processor | `rfexec.ProcessRegionFence` |
+
+Correctness for RegionFence is writer-push invalidation to the region
+checkpoint, not read-set revalidation. The OCC baseline does validate and
+re-execute. Both refuse to spin when a producer has already finished: a
+nonce or estimate miss parks on the lower transaction.
+
+## Known gaps versus design section 6
+
+- Greedy threshold instead of Thompson sampling.
+- No `FIN_LASTW`, no early publish, and no retract cascade beyond
+  invalidating readers of a version that is removed.
+- No ORDER hand-off.
+- C is fixed. The pool accepts a new active count, but nothing learns C
+  and there is no watchdog.
+- Rollback restarts the transaction and fast-forwards by read sequence.
+  Fast-forward skips waits; it still re-registers readers. Interpreter
+  frames are not restored from the snapshot.
+- No empirical-Bayes decay. Priors are carried without forgetting.
+- Replay cost and wait cost are both 1.
+- OCC parks on a nonce producer instead of retrying immediately, so it is
+  not a byte-for-byte Block-STM loop. The change is there to avoid the
+  known livelock.
+- System-contract storage is absent from the fixtures. Only canonical code
+  is seeded.
+- EIP-2935 is given `header.ParentHash`. A synthetic parent header's
+  `Hash()` is not the real parent hash.
+- Pre/post system calls use a dummy block access list so the exported
+  helpers do not merge into a nil receiver. `state_processor.go` is not
+  modified.
+- No delta or commutative fee trick, and no EIP-7928 block access list.
