@@ -24,14 +24,20 @@ import (
 	"strings"
 )
 
-// LayoutCPUs reorders a pin list so worker i and worker i+1 share a
-// last-level cache whenever the machine reports one. The group key is the
-// highest-index cache's shared_cpu_list under
+// LayoutCPUs reorders a pin list so the first active workers share a
+// last-level cache before any worker spills into the next one. The group
+// key is the highest-index cache's shared_cpu_list under
 // /sys/devices/system/cpu/cpuN/cache (the CCX on EPYC parts, whatever size
 // the kernel reports — the size is not hardcoded). Groups are ordered by
-// their smallest CPU id, and CPUs inside a group are sorted, so the first
-// active workers occupy the fewest groups. If sysfs is missing for any CPU,
-// the input order is returned and groups is nil.
+// their smallest CPU id, and CPUs inside a group are sorted.
+//
+// Harness mapping: cmd/rfbench passes the reordered list to NewPool, which
+// pins worker i to ordered[i%len]. The pool's active set is the lowest
+// worker ids, so it is a prefix of this list. A pin list that straddles two
+// caches (for example 129-136 on a machine whose caches are 128-135 and
+// 136-143) is rewritten so the whole first cache comes before the spill.
+// If sysfs is missing for any CPU, the input order is returned and groups
+// is nil; the harness then pins worker i to the caller's i-th CPU.
 func LayoutCPUs(cpus []int) (ordered []int, groups []string) {
 	ordered, groups, _ = layoutCPUs(cpus, readCacheGroup)
 	return ordered, groups

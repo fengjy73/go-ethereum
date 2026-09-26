@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -405,6 +406,65 @@ func TestLoadFixtureShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("serial %s gas %d", out.Wall, out.GasUsed)
+}
+
+func TestFrontierWidthCountsReadyHeads(t *testing.T) {
+	env := &BlockEnv{
+		Txs:      make([]*types.Transaction, 4),
+		PrevSame: []int{-1, 0, -1, 2},
+	}
+	s := newSched(env, rfstate.ModeRF, nil, nil)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if got := s.frontierWidthLocked(); got != 2 {
+		t.Fatalf("chain heads %d", got)
+	}
+	s.txs[0].status = stParked
+	if got := s.frontierWidthLocked(); got != 1 {
+		t.Fatalf("parked head %d", got)
+	}
+	s.txs[0].status = stFinal
+	s.frontier = 1
+	if got := s.frontierWidthLocked(); got != 2 {
+		t.Fatalf("unblocked successor %d", got)
+	}
+}
+
+func TestAutoPriorSurvivesFixtureTail(t *testing.T) {
+	sub := findBlockDir("22411250")
+	if sub == "" {
+		t.Skip("fixture not present")
+	}
+	env, err := LoadFixture(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(prev)
+	pool := rfstate.NewPool([]int{0, 1, 2, 3}, 4)
+	defer pool.Stop()
+	out, err := ExecAuto(env, pool, rfstate.NewLearner(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("trace %s active %d best %d execs %d rollbacks %d idle %d", out.CTrace, out.ActiveC, out.CrewBest, out.Counters.Executions, out.Counters.Rollbacks, out.Counters.IdleNs)
+	if out.CrewBest < 2 {
+		t.Fatalf("tail drained the prior to %d trace %s", out.CrewBest, out.CTrace)
+	}
+}
+
+func TestAutoDoesNotChangeGOMAXPROCS(t *testing.T) {
+	prev := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(prev)
+	env := syntheticEnv(t)
+	pool := rfstate.NewPool([]int{0, 1, 2, 3}, 4)
+	defer pool.Stop()
+	if _, err := ExecAuto(env, pool, nil, 4); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.GOMAXPROCS(0); got != 4 {
+		t.Fatalf("GOMAXPROCS %d", got)
+	}
 }
 
 func TestLoadPostPectraShape(t *testing.T) {

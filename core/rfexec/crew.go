@@ -17,51 +17,81 @@
 package rfexec
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"time"
 )
 
+const (
+	phaseMulti = iota
+	phaseRefine
+)
+
 // crew chooses how many workers execute one block.
 //
-// The active count is the hill-climb trial, capped by the structural width
-// (distinct senders that still have a non-final transaction) and by the
-// process limit (pin-list length and GOMAXPROCS at block start). The
-// cross-block prior is the starting trial, not a ceiling: a cold prior of 0
-// starts at 1 and may step up, and a prior of 4 may step to 5 when width
-// allows. The next block's prior is Best, the trial with the highest
-// measured gas per nanosecond, not an unmeasured step past it.
+// The active count starts at the cross-block prior, capped by the structural
+// width (ready transactions on the dependency frontier) and by the process
+// limit. A cold prior of 0 starts at one. Best is that capped prior until a
+// window measures something better, so a block that never closes a window
+// still carries the prior. Tail drain may lower the active count, but it
+// does not change Best: the next block must not start at the drained width.
 //
-// Throughput samples are equal-gas intervals. The first completed
-// transaction sets the quantum; that interval is only a baseline. A faster
-// interval keeps the current direction. A slower one steps back to the best
-// trial and stops, so the search does not oscillate. An unmeasured probe in
-// the opposite direction is not started: the rest of the block would run
-// there if that interval never closed.
+// A window is a run of per-completion gas-per-nanosecond samples. It closes
+// once there is a completion per active worker (at least two) and the
+// standard error is at most half the mean, or the samples do not vary.
+// Fewer completions have not seen a wave of this trial. A noisy window
+// stays open until more completions shrink the error; it does not move the
+// search on its own. The 4 in that sample-size rule is the count that makes
+// the standard error half the mean; it is not a worker count. Two closed
+// windows at the starting count form the baseline, and the bar is the
+// faster of the two. A later slower slice at that same count does not lower
+// the bar. The rate is gas over wall time for the whole window, not the
+// mean of per-transaction rates. A probe that beats the bar by more than
+// the sum of the two standard errors records Best and takes another
+// multiplicative step (double, or half). A probe that is slower or only
+// inside the noise returns to Best at once: noise is not a reason to spend
+// the rest of the block away from the recorded best. That return switches
+// to ±1 refinement. The next window at Best takes one step, and a worse
+// refinement tries the other direction once. A window already at Best that
+// is inside the noise does not move, unless that refinement step is still
+// pending.
 //
-// The watchdog shrinks on a measured storm: more aborts than completions in
-// the interval, or summed idle time greater than the wall time of every
-// extra worker (each of the active-1 workers idle for the whole interval).
-// A run of aborts with no completion, one per active worker, also shrinks
-// before the quantum can fill. Those are comparisons of counts the interval
-// already collected.
+// The watchdog halves the active count on an abort storm (no completion and
+// at least one abort per active worker, or more aborts than completions in
+// a closed window) or on sustained idle (idle time greater than the wall
+// time of every extra worker, over a closed window that still had a full
+// frontier). It does not run while the width cap is holding the active
+// count down. The shrink does not change Best: a storm at the tail must not
+// become the next block's prior. This block does not climb back.
 type crew struct {
-	prior    int
-	max      int
-	width    int
-	active   int
-	bestC    int
-	bestTP   float64
-	dir      int
-	haveBase bool
-	quantum  uint64
-	gas      uint64
-	aborts   uint64
-	dones    uint64
-	idle     int64
-	winStart time.Time
-	trace    []int
-	now      func() time.Time
+	prior            int
+	max              int
+	width            int
+	active           int
+	bestC            int
+	bestTP           float64
+	baseSem          float64
+	dir              int
+	phase            int
+	refineDir        int
+	pinned           bool
+	haveBase         bool
+	noUp             bool
+	refinePending    bool
+	refineTriedOther bool
+
+	samples    []float64
+	gasSum     float64
+	dtSum      float64
+	bestN      int
+	aborts     uint64
+	dones      uint64
+	idle       int64
+	winStart   time.Time
+	lastSample time.Time
+	trace      []int
+	now        func() time.Time
 }
 
 func newCrew(prior, max int) *crew {
@@ -72,35 +102,28 @@ func newCrew(prior, max int) *crew {
 }
 
 // begin sets the starting trial from the prior and the current width.
+// Best starts there too, so an unmeasured block carries the capped prior.
 func (c *crew) begin(width int) int {
 	c.width = width
 	if c.width < 1 {
 		c.width = 1
 	}
-	start := 1
-	if c.prior > 0 {
-		start = c.prior
-	}
-	if start > c.width {
-		start = c.width
-	}
-	if start > c.max {
-		start = c.max
-	}
+	start := c.prior
 	if start < 1 {
 		start = 1
 	}
+	if start > c.limit() {
+		start = c.limit()
+	}
 	c.active = start
 	c.bestC = start
-	limit := c.limit()
-	if start < limit {
-		c.dir = 1
-	} else if start > 1 {
-		c.dir = -1
-	} else {
-		c.dir = 0
-	}
+	c.dir = 0
+	c.phase = phaseMulti
+	c.pinned = false
+	c.haveBase = false
+	c.noUp = false
 	c.winStart = c.now()
+	c.lastSample = c.winStart
 	c.trace = []int{start}
 	return start
 }
@@ -116,107 +139,254 @@ func (c *crew) limit() int {
 	return n
 }
 
-// setWidth lowers the structural cap. The active count follows it down.
+// setWidth applies a new structural cap. Shrinking below the active count
+// parks the search (pinned): Best is left alone. Growing back to Best
+// resumes at Best. A cap still below Best follows the cap and stays pinned.
 func (c *crew) setWidth(width int) (int, bool) {
 	if width < 1 {
 		width = 1
 	}
 	c.width = width
-	if c.active <= c.width {
+	limit := c.limit()
+	if c.pinned && c.bestC <= limit {
+		c.pinned = false
+		if c.active != c.bestC {
+			c.active = c.bestC
+			if c.active > limit {
+				c.active = limit
+			}
+			c.resetWindow()
+			c.note()
+			return c.active, true
+		}
 		return c.active, false
 	}
-	c.active = c.width
-	if c.active > c.max {
-		c.active = c.max
+	if c.pinned {
+		if c.active != limit {
+			c.active = limit
+			c.resetWindow()
+			c.note()
+			return c.active, true
+		}
+		return c.active, false
 	}
-	c.haveBase = false
-	c.bestC = c.active
-	c.bestTP = 0
-	c.dir = 0
+	if c.active <= limit {
+		return c.active, false
+	}
+	c.active = limit
+	c.pinned = true
 	c.resetWindow()
 	c.note()
 	return c.active, true
 }
 
-// tick folds one scheduler event into the current interval.
+// tick folds one scheduler event into the current window.
 // gas is the gas of a completion (0 on a rollback). dones is 1 when this
 // event finalized a transaction. aborts and idle are deltas since the
-// previous tick.
+// previous tick. While the width cap is holding the active count down,
+// the event is ignored so tail drain cannot move Best.
 func (c *crew) tick(gas uint64, idleNs int64, aborts, dones uint64) (int, bool) {
+	if c.pinned {
+		return c.active, false
+	}
 	if c.winStart.IsZero() {
 		c.winStart = c.now()
+		c.lastSample = c.winStart
 	}
-	var add uint64
+	now := c.now()
 	if dones > 0 {
-		add = gas
+		add := gas
 		if add == 0 {
 			add = 1
 		}
-		if c.quantum == 0 {
-			c.quantum = add
+		dt := now.Sub(c.lastSample).Nanoseconds()
+		if dt < 1 {
+			dt = 1
 		}
-		c.gas += add
+		c.samples = append(c.samples, float64(add)/float64(dt))
+		c.gasSum += float64(add)
+		c.dtSum += float64(dt)
+		c.lastSample = now
+		c.dones += dones
 	}
 	c.idle += idleNs
 	c.aborts += aborts
-	c.dones += dones
 
-	// No completion yet, and every active worker has already aborted.
 	if c.active > 1 && c.dones == 0 && c.aborts >= uint64(c.active) {
-		return c.shrink()
+		return c.shrinkStorm()
 	}
-	if c.quantum == 0 || c.gas < c.quantum {
+	if !c.windowClosed() {
 		return c.active, false
 	}
-	elapsed := c.now().Sub(c.winStart).Nanoseconds()
+	elapsed := now.Sub(c.winStart).Nanoseconds()
 	if elapsed < 1 {
 		elapsed = 1
 	}
-	if c.active > 1 && (c.aborts > c.dones || (c.dones > 0 && c.idle > elapsed*int64(c.active-1))) {
-		return c.shrink()
+	if c.watchdog(elapsed) {
+		return c.shrinkStorm()
 	}
-	tp := float64(c.gas) / float64(elapsed)
+	return c.decide()
+}
+
+func (c *crew) windowClosed() bool {
+	n := len(c.samples)
+	// One completion per active worker, and at least two. A shorter window
+	// has not seen a full wave of the current trial, so parallel overlap is
+	// invisible and a serial slice can look faster.
+	needN := c.active
+	if needN < 2 {
+		needN = 2
+	}
+	if n < needN {
+		return false
+	}
+	mean, std := c.meanStd()
+	if mean <= 0 || std == 0 {
+		return true
+	}
+	ratio := std / mean
+	// n >= 4*(std/mean)^2 makes the standard error at most half the mean.
+	// A noisy pair of samples must not close the window early: that margin
+	// is already wider than the mean, so the next samples have to shrink it.
+	need := 4 * ratio * ratio
+	return float64(n)+1e-9 >= need
+}
+
+func (c *crew) meanStd() (mean, std float64) {
+	n := float64(len(c.samples))
+	if n == 0 {
+		return 0, 0
+	}
+	var sum float64
+	for _, x := range c.samples {
+		sum += x
+	}
+	mean = sum / n
+	if n < 2 {
+		return mean, 0
+	}
+	var ss float64
+	for _, x := range c.samples {
+		d := x - mean
+		ss += d * d
+	}
+	std = math.Sqrt(ss / (n - 1))
+	return mean, std
+}
+
+func (c *crew) watchdog(elapsed int64) bool {
+	if c.active <= 1 {
+		return false
+	}
+	if c.aborts > c.dones {
+		return true
+	}
+	// Idle of every extra worker for the whole window, and the frontier
+	// still had room for this many workers (otherwise this is tail drain).
+	if c.dones >= 2 && c.limit() >= c.active && c.idle > elapsed*int64(c.active-1) {
+		return true
+	}
+	return false
+}
+
+func (c *crew) decide() (int, bool) {
+	_, std := c.meanStd()
+	n := float64(len(c.samples))
+	sem := 0.0
+	if n > 0 {
+		sem = std / math.Sqrt(n)
+	}
+	tp := 0.0
+	if c.dtSum > 0 {
+		tp = c.gasSum / c.dtSum
+	}
 	c.resetWindow()
 	if !c.haveBase {
+		// A shrink before the baseline leaves the prior in place.
+		if c.active != c.bestC {
+			return c.active, false
+		}
+		// Two windows before the first probe, so the bar is not a single
+		// heavy slice of the block. The bar is the faster of the two.
+		c.bestN++
+		if tp > c.bestTP {
+			c.bestTP = tp
+			c.baseSem = sem
+		}
+		if c.bestN < 2 {
+			return c.active, false
+		}
 		c.haveBase = true
+		c.dir = c.probeDir()
+		return c.stepMulti()
+	}
+	if c.active == c.bestC {
+		// Keep the faster slice. A later slow slice must not lower the bar
+		// and let a smaller trial look like a win.
+		if tp > c.bestTP {
+			c.bestTP = tp
+			c.baseSem = sem
+		}
+		if c.refinePending {
+			return c.stepRefine()
+		}
+		return c.active, false
+	}
+	thresh := sem + c.baseSem
+	if tp > c.bestTP+thresh {
 		c.bestTP = tp
 		c.bestC = c.active
-		return c.step()
+		c.baseSem = sem
+		c.bestN = 1
+		if c.phase == phaseRefine {
+			return c.stepRefine()
+		}
+		return c.stepMulti()
 	}
-	if tp > c.bestTP {
-		c.bestTP = tp
-		c.bestC = c.active
-		return c.step()
-	}
+	// Not a clear improvement: leave the probe. Noise is not a reason to
+	// run the rest of the block away from the recorded best.
 	return c.onWorse()
 }
 
-func (c *crew) shrink() (int, bool) {
-	if c.active <= 1 {
-		c.resetWindow()
-		return c.active, false
+func (c *crew) probeDir() int {
+	if c.noUp {
+		return 0
 	}
-	c.active--
-	if c.active > c.limit() {
-		c.active = c.limit()
+	// Step up whenever the cap still has room. stepMulti clamps a double
+	// that would pass the cap, so a prior of 3 with room for 4 probes 4
+	// rather than halving.
+	if c.active < c.limit() {
+		return 1
 	}
-	// Stay at the reduced trial. Climbing again in the same block re-enters
-	// the storm that caused the shrink. The next block can start from Best.
-	c.haveBase = false
-	c.bestC = c.active
-	c.bestTP = 0
-	c.dir = 0
-	c.resetWindow()
-	c.note()
-	return c.active, true
+	if c.active > 1 {
+		return -1
+	}
+	return 0
 }
 
-func (c *crew) step() (int, bool) {
-	if c.dir == 0 {
+func (c *crew) stepMulti() (int, bool) {
+	if c.dir == 0 || (c.noUp && c.dir > 0) {
 		return c.active, false
 	}
-	next := c.active + c.dir
-	if next < 1 || next > c.limit() {
+	var next int
+	if c.dir > 0 {
+		next = c.active * 2
+		if next <= c.active {
+			next = c.active + 1
+		}
+	} else {
+		next = c.active / 2
+		if next < 1 || next == c.active {
+			next = c.active - 1
+		}
+	}
+	if next < 1 {
+		next = 1
+	}
+	if next > c.limit() {
+		next = c.limit()
+	}
+	if next == c.active {
 		c.dir = 0
 		return c.active, false
 	}
@@ -227,6 +397,7 @@ func (c *crew) step() (int, bool) {
 
 func (c *crew) onWorse() (int, bool) {
 	changed := false
+	probedUp := c.active > c.bestC
 	if c.active != c.bestC {
 		c.active = c.bestC
 		if c.active > c.limit() {
@@ -236,16 +407,83 @@ func (c *crew) onWorse() (int, bool) {
 		changed = true
 		c.note()
 	}
+	if c.phase == phaseMulti {
+		c.phase = phaseRefine
+		if probedUp || c.bestC <= 1 {
+			c.refineDir = 1
+		} else {
+			c.refineDir = -1
+		}
+		c.refinePending = true
+		c.refineTriedOther = false
+		return c.active, changed
+	}
+	if !c.refineTriedOther {
+		c.refineDir = -c.refineDir
+		if c.refineDir == 0 {
+			c.refineDir = -1
+		}
+		c.refinePending = true
+		c.refineTriedOther = true
+		return c.active, changed
+	}
+	c.refinePending = false
 	c.dir = 0
 	return c.active, changed
 }
 
+func (c *crew) stepRefine() (int, bool) {
+	c.refinePending = false
+	if c.refineDir == 0 || (c.noUp && c.refineDir > 0) {
+		return c.active, false
+	}
+	next := c.active + c.refineDir
+	if next < 1 || next > c.limit() {
+		if !c.refineTriedOther {
+			c.refineDir = -c.refineDir
+			c.refineTriedOther = true
+			next = c.active + c.refineDir
+		}
+		if next < 1 || next > c.limit() || next == c.active {
+			c.dir = 0
+			return c.active, false
+		}
+	}
+	c.active = next
+	c.note()
+	return c.active, true
+}
+
+func (c *crew) shrinkStorm() (int, bool) {
+	if c.active <= 1 {
+		c.resetWindow()
+		return c.active, false
+	}
+	next := c.active / 2
+	if next < 1 || next >= c.active {
+		next = c.active - 1
+	}
+	if next > c.limit() {
+		next = c.limit()
+	}
+	c.active = next
+	c.noUp = true
+	c.dir = 0
+	c.refinePending = false
+	c.resetWindow()
+	c.note()
+	return c.active, true
+}
+
 func (c *crew) resetWindow() {
-	c.gas = 0
+	c.samples = c.samples[:0]
+	c.gasSum = 0
+	c.dtSum = 0
 	c.aborts = 0
 	c.dones = 0
 	c.idle = 0
 	c.winStart = c.now()
+	c.lastSample = c.winStart
 }
 
 func (c *crew) note() {
@@ -257,8 +495,8 @@ func (c *crew) note() {
 // Active is the current trial.
 func (c *crew) Active() int { return c.active }
 
-// Best is the trial with the highest measured throughput, or the start
-// when the block ended before an interval closed.
+// Best is the trial with the highest measured throughput. Before any window
+// closes it is the capped prior, never a later tail-drain width.
 func (c *crew) Best() int {
 	if c.bestC > 0 {
 		return c.bestC
@@ -269,7 +507,7 @@ func (c *crew) Best() int {
 	return 1
 }
 
-// Trace is the chosen active counts, joined as "1-4-2".
+// Trace is the chosen active counts, joined as "4-8-4".
 func (c *crew) Trace() string {
 	if len(c.trace) == 0 {
 		return strconv.Itoa(c.active)

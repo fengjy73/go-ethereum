@@ -50,6 +50,16 @@
 3. **已完成** `v.early` 只在 `ModeRF` 且 `Parallel()` 时为真。围栏等待、前缀等待和同一发送者停靠会 `retract`，因为 signal panic 不跑 journal。自毁或清空账户时撤掉本交易提前发布的槽。
 4. **已完成** 十块 `TestFixtureEngines` 与 `go test -race`（rfexec 约 81s）通过。RF C=2 与 C=4 各 K=30、C=8 K=15 退出码 0。本机 K=3、`GOMAXPROCS=C` 的中位数几何平均：rf C=1 / serial = 1.31（目标 1.30，差 0.01）。剖面与表写在 PR #1。
 
+## Stage 2b（代码已验证，待提交；用户尚未验收）
+
+目标：修好 rf-auto 的跨块先验和 `GOMAXPROCS` 竞态，让自动 C 按依赖前沿爬坡；同时再砍 C=1 的 TxView 开销。同一分支 / PR #1。十块正确性与 race 保持通过。ict21 上的 10% 与 1.30x 目标本机不能代替。
+
+1. **已完成** 执行器不再调用 `runtime.GOMAXPROCS`。进程上限只读一次，活跃 worker 由池的 `SetActiveIf(gen)` 控制。过期的 `Drive` 代际被丢掉。`TestAutoDoesNotChangeGOMAXPROCS`、`TestSetActiveIfIgnoresStaleGen` 通过。
+2. **已完成** 结构宽度改为前沿上就绪或正在执行、且没有被同发送者前序挡住、也没有停在围栏上的交易数。尾部收缩和看门狗都不写 `CrewBest`。下一块从体部测到的最佳 C 开始。`TestFrontierWidthCountsReadyHeads`、`TestCrewTailDrainKeepsBest`、`TestAutoPriorSurvivesFixtureTail` 通过。
+3. **已完成** 爬坡：两窗基线，横杆取较快的一窗且不被同 C 的慢切片拉低；点估计是整窗 gas/wall；明显更快才 ×2 或 /2，否则立刻回到最佳再 ±1。看门狗只在中止风暴或持续空转时减半，本块不再爬回去，也不改记录的最佳 C。`TestCrewDoublesOnFaster`、`TestCrewSlowerRefines`、`TestCrewNoiseStays`、`TestCrewAbortStorm`、`TestCrewIdleStorm`、`TestCrewRefineTriesOtherSide` 通过。
+4. **已完成** C=1 跳过 fence 和 abort 原子读；账户 wipe 只读一次；固定 C=1 的 `ObserveSafeBatch` 延到块末。`TxView` 本来就实现 `vm.StateDB`，没有适配层可删。
+5. **已完成（数字未达目标）** `TestFixtureEngines` 在最终策略后通过。`go test -race` 下 `core/rfstate` 1.0s、`core/rfexec` 88.8s，退出码 0。RF C=2 与 C=4 各 K=30、C=8 K=15 在最终策略之前的固定 C 路径上退出码 0（固定 C 不走 crew）。lint 0 issues，`check_baddeps` 通过，`make all` 退出码 0。本机 K=3、`GOMAXPROCS=C`、cpus 0-3 的第二次中位数：rf C=1 / serial 几何平均 1.35（更早一次同 C=1 代码、旧 crew 的几何平均是 1.275，stage 2 提交是 1.31；1.30 没有站住）。rf-auto reset / 每块最佳固定 rf C = 1.19，carry = 1.116，都没有进 10%。22418000 的 reset 从 1 起是 1.66，carry 从 4 起是 1.03。C=1 剖面采样 10ms，TxView / Ledger / sched 的 flat 都在一两格采样里，不能用来声称桶下降；ALLOC 相对 stage 2 剖面略高。
+
 ## 验证记录
 
 - `go test ./core/rfstate` 通过，含 `TestDropEstimatesRemovesUnpublishedKey`。

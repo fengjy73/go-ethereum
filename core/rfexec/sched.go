@@ -26,7 +26,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rfstate"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -43,8 +42,9 @@ const (
 	// EngineRF is RegionFence P0 at a fixed worker count.
 	EngineRF = "rf"
 	// EngineAuto is RegionFence with a learned worker count. The maximum
-	// is the pin-list length (and GOMAXPROCS at process start); -c is not
-	// the active count.
+	// is the pin-list length and the process GOMAXPROCS, which is only
+	// read. The active count is gated in the pool; this package does not
+	// change GOMAXPROCS. -c is not the active count.
 	EngineAuto = "rf-auto"
 
 	maxAttempts = 10000
@@ -120,12 +120,12 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 	s.procCap = procCap
 	s.auto = auto
 	if auto {
-		s.initWidth()
+		s.mu.Lock()
+		s.width = s.frontierWidthLocked()
+		s.mu.Unlock()
 		limit := autoLimit(pool, procCap)
 		s.crew = newCrew(crewPrior, limit)
 		workers = s.crew.begin(s.width)
-		runtime.GOMAXPROCS(workers)
-		defer runtime.GOMAXPROCS(procCap)
 	}
 	s.bindWorkers(pool.Width())
 	pool.Drive(workers, s.Step, s.Done)
@@ -134,6 +134,7 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 	if err != nil {
 		return nil, err
 	}
+	s.flushLearn()
 	s.ledger.Fold(store, env.Header.Coinbase)
 	s.ledger.ClearVersions()
 	receipts := s.receipts()
@@ -238,15 +239,14 @@ type sched struct {
 	evms     []*vm.EVM
 	jumps    vm.JumpDestCache
 
-	pool       *rfstate.Pool
-	procCap    int
-	auto       bool
-	crew       *crew
-	senderLeft map[common.Address]int
-	width      int
-	widthDirty bool
-	crewRoll   uint64
-	crewIdle   int64
+	pool        *rfstate.Pool
+	procCap     int
+	auto        bool
+	crew        *crew
+	width       int
+	crewRoll    uint64
+	crewIdle    int64
+	pendingSafe []rfstate.Key
 }
 
 func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *rfstate.Learner) *sched {
@@ -299,32 +299,58 @@ func (s *sched) Parallel() bool {
 	return s.pool.Active() > 1
 }
 
-func (s *sched) initWidth() {
-	s.senderLeft = make(map[common.Address]int)
-	for _, addr := range s.env.Senders {
-		s.senderLeft[addr]++
+// frontierWidthLocked counts transactions that can take a worker now:
+// ready or running, not parked on a fence, and not blocked on an earlier
+// transaction from the same sender. Parked status is the fence (a read
+// observed WAIT_FINAL, WAIT_PREFIX, or WAIT_ESTIMATE). PrevSame is the
+// sender chain. Read and write sets are not scanned here: that would take
+// the learner or a ledger key lock while sched.mu is held.
+func (s *sched) frontierWidthLocked() int {
+	n := 0
+	for i := s.frontier; i < len(s.txs); i++ {
+		st := s.txs[i].status
+		if st != stReady && st != stRunning {
+			continue
+		}
+		if s.senderBlockedLocked(i) {
+			continue
+		}
+		n++
 	}
-	s.width = len(s.senderLeft)
-	if s.width < 1 {
-		s.width = 1
+	if n < 1 {
+		return 1
 	}
+	return n
 }
 
-func (s *sched) noteSenderFinal(tx int) {
-	if s.crew == nil || tx < 0 || tx >= len(s.env.Senders) {
+func (s *sched) senderBlockedLocked(tx int) bool {
+	if s.env == nil || tx < 0 || tx >= len(s.env.PrevSame) {
+		return false
+	}
+	prev := s.env.PrevSame[tx]
+	if prev < 0 || prev >= len(s.txs) {
+		return false
+	}
+	st := s.txs[prev].status
+	return st != stFinished && st != stFinal
+}
+
+// deferLearn holds safe-read observations until the block ends. Only a
+// fixed single worker does this: nothing else in the block consults the
+// learner, and the per-transaction batch was measurable bookkeeping.
+func (s *sched) deferLearn() bool {
+	return !s.auto && s.pool != nil && s.pool.Active() <= 1
+}
+
+func (s *sched) flushLearn() {
+	if s.learner == nil {
 		return
 	}
-	addr := s.env.Senders[tx]
-	n := s.senderLeft[addr]
-	if n <= 0 {
-		return
-	}
-	n--
-	s.senderLeft[addr] = n
-	if n == 0 && s.width > 1 {
-		s.width--
-		s.widthDirty = true
-	}
+	s.mu.Lock()
+	keys := s.pendingSafe
+	s.pendingSafe = nil
+	s.mu.Unlock()
+	s.learner.ObserveSafeBatch(keys)
 }
 
 func (s *sched) Done() bool {
@@ -525,9 +551,10 @@ func (s *sched) aborted(idx int, attempt uint64, evm *vm.EVM) bool {
 func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 	var applyN int
 	var doApply bool
+	gen := s.blockGen()
 	defer func() {
 		if doApply {
-			s.applyActive(applyN)
+			s.applyActive(applyN, gen)
 		}
 	}()
 	s.mu.Lock()
@@ -594,9 +621,10 @@ func (s *sched) noteWaitLocked(k rfstate.SigKind) {
 func (s *sched) onErr(idx int, attempt uint64, err error) {
 	var applyN int
 	var doApply bool
+	gen := s.blockGen()
 	defer func() {
 		if doApply {
-			s.applyActive(applyN)
+			s.applyActive(applyN, gen)
 		}
 	}()
 	s.mu.Lock()
@@ -651,9 +679,10 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 func (s *sched) discard(idx int, attempt uint64) {
 	var applyN int
 	var doApply bool
+	gen := s.blockGen()
 	defer func() {
 		if doApply {
-			s.applyActive(applyN)
+			s.applyActive(applyN, gen)
 		}
 	}()
 	s.mu.Lock()
@@ -692,9 +721,10 @@ func (s *sched) requeueRunningLocked(idx int) {
 func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *core.ExecutionResult) {
 	var applyN int
 	var doApply bool
+	gen := s.blockGen()
 	defer func() {
 		if doApply {
-			s.applyActive(applyN)
+			s.applyActive(applyN, gen)
 		}
 	}()
 	if s.mode == rfstate.ModeOCC {
@@ -720,9 +750,15 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 	// Copy read keys before unlock. ClearVersions runs as soon as wait()
 	// observes a finished block, and a worker can still be in finish then.
 	var safe []rfstate.Key
+	learnNow := false
 	if s.learner != nil {
 		for _, tx := range finalTx {
 			safe = append(safe, s.ledger.ReadKeys(tx)...)
+		}
+		if s.deferLearn() {
+			s.pendingSafe = append(s.pendingSafe, safe...)
+		} else {
+			learnNow = true
 		}
 	}
 	gas := result.UsedGas
@@ -730,7 +766,9 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 	s.wakeLocked()
 	s.cv.Broadcast()
 	s.mu.Unlock()
-	s.learner.ObserveSafeBatch(safe)
+	if learnNow {
+		s.learner.ObserveSafeBatch(safe)
+	}
 }
 
 func (s *sched) tryAdvanceLocked() []int {
@@ -767,7 +805,6 @@ func (s *sched) tryAdvanceLocked() []int {
 			finalTx = append(finalTx, tx)
 		}
 		t.status = stFinal
-		s.noteSenderFinal(tx)
 		s.frontier++
 	}
 	return finalTx
@@ -823,10 +860,15 @@ func (s *sched) crewSampleLocked(gas uint64, done bool) (int, bool) {
 	if s.crew == nil {
 		return 0, false
 	}
-	if s.widthDirty {
-		n, ch := s.crew.setWidth(s.width)
-		s.widthDirty = false
+	w := s.frontierWidthLocked()
+	if w != s.width {
+		s.width = w
+		n, ch := s.crew.setWidth(w)
 		if ch {
+			// Drop this event's idle and aborts. Replaying them after the
+			// width cap lifts would look like a storm in the block body.
+			s.crewRoll = s.ctr.Rollbacks
+			s.crewIdle = s.ctr.IdleNs
 			return n, true
 		}
 	}
@@ -844,10 +886,21 @@ func (s *sched) crewSampleLocked(gas uint64, done bool) (int, bool) {
 	return s.crew.tick(gas, idle, roll, dones)
 }
 
-// applyActive publishes a new worker count. The scheduler lock is not held:
-// SetActive takes the pool lock, and the pool calls Step which takes the
-// scheduler lock.
-func (s *sched) applyActive(n int) {
+// blockGen is the Drive generation captured before the scheduler lock, so a
+// deferred apply cannot observe a generation published while it waited.
+func (s *sched) blockGen() uint64 {
+	if s.pool == nil {
+		return 0
+	}
+	return s.pool.Generation()
+}
+
+// applyActive publishes a new worker count for gen. The scheduler lock is
+// not held across the pool: SetActiveIf takes the pool lock, and a worker
+// holds that lock only before Step. GOMAXPROCS is not changed. A generation
+// that Drive has already replaced is ignored, and a finished block does not
+// broadcast into the next one.
+func (s *sched) applyActive(n int, gen uint64) {
 	if !s.auto || s.pool == nil {
 		return
 	}
@@ -857,10 +910,13 @@ func (s *sched) applyActive(n int) {
 	if s.procCap > 0 && n > s.procCap {
 		n = s.procCap
 	}
-	runtime.GOMAXPROCS(n)
-	s.pool.SetActive(n)
+	if !s.pool.SetActiveIf(gen, n) {
+		return
+	}
 	s.mu.Lock()
-	s.cv.Broadcast()
+	if s.pool.Generation() == gen && !s.doneLocked() {
+		s.cv.Broadcast()
+	}
 	s.mu.Unlock()
 }
 

@@ -34,6 +34,9 @@ import (
 type Pool struct {
 	cpus   []int
 	active atomic.Int32
+	// gen identifies the block Drive published. A SetActive from a previous
+	// block is ignored once the next Drive has bumped it.
+	gen atomic.Uint64
 
 	mu     sync.Mutex
 	cv     *sync.Cond
@@ -106,30 +109,57 @@ func (p *Pool) PinReport() []string {
 }
 
 // SetActive changes how many workers take tasks. Workers with id >= c stay parked.
+// Prefer SetActiveIf from a block that may already have ended.
 func (p *Pool) SetActive(c int) {
 	if c < 1 {
 		c = 1
 	}
-	p.active.Store(int32(c))
 	p.mu.Lock()
+	p.active.Store(int32(c))
 	p.cv.Broadcast()
 	p.mu.Unlock()
+}
+
+// Generation is the block id of the latest Drive.
+func (p *Pool) Generation() uint64 { return p.gen.Load() }
+
+// SetActiveIf changes the active count only when gen is still the latest
+// Drive. A deferred update from the previous block returns false.
+func (p *Pool) SetActiveIf(gen uint64, c int) bool {
+	if c < 1 {
+		c = 1
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.gen.Load() != gen {
+		return false
+	}
+	p.active.Store(int32(c))
+	p.cv.Broadcast()
+	return true
 }
 
 // Active is the current worker limit.
 func (p *Pool) Active() int { return int(p.active.Load()) }
 
-// Drive runs r to completion on the active workers.
-func (p *Pool) Drive(active int, step func(worker int), done func() bool) {
-	p.SetActive(active)
+// Drive publishes one block and returns its generation. The active count is
+// stored in the same critical section as the generation bump, so a stale
+// SetActiveIf cannot land between the two. GOMAXPROCS is not changed.
+func (p *Pool) Drive(active int, step func(worker int), done func() bool) uint64 {
+	if active < 1 {
+		active = 1
+	}
 	r := &runner{Step: step, Done: done}
-	p.sched.Store(r)
 	p.mu.Lock()
+	gen := p.gen.Add(1)
+	p.active.Store(int32(active))
+	p.sched.Store(r)
 	p.cv.Broadcast()
 	p.mu.Unlock()
 	// The caller waits on its own scheduler condition; Drive only publishes
 	// the hook. rfexec waits for frontier completion separately and then
 	// calls Release.
+	return gen
 }
 
 // Release unhooks the current block so workers return to the pool wait.

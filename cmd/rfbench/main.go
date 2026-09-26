@@ -94,9 +94,10 @@ func main() {
 	}
 	// The pin list is a placement set. It must not inflate GOMAXPROCS or the
 	// worker count: a 128-CPU mask with -c 4 used to start 128 threads.
-	// rf-auto is the exception: its pool and, when GOMAXPROCS is unset, the
-	// process cap equal the pin list so the block can lower GOMAXPROCS to
-	// the active trial. An explicit GOMAXPROCS is left as set.
+	// rf-auto's pool, and when GOMAXPROCS is unset the process cap, equal
+	// the pin list. The cap is set once. The block gates workers in the
+	// pool and does not call GOMAXPROCS again. An explicit GOMAXPROCS is
+	// left as set.
 	if _, ok := os.LookupEnv("GOMAXPROCS"); !ok {
 		runtime.GOMAXPROCS(maxC)
 	}

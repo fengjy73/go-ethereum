@@ -53,6 +53,36 @@ func TestLayoutCPUsKeepsOrderWithoutSysfs(t *testing.T) {
 	}
 }
 
+func TestLayoutCPUsFillsOneGroupBeforeSpill(t *testing.T) {
+	// 129-136 straddles two 8-CPU caches. The input starts on the second.
+	in := []int{136, 129, 130, 131, 132, 133, 134, 135}
+	groupOf := func(cpu int) (string, bool) {
+		if cpu >= 128 && cpu <= 135 {
+			return "128-135", true
+		}
+		if cpu >= 136 && cpu <= 143 {
+			return "136-143", true
+		}
+		return "", false
+	}
+	out, labels, ok := layoutCPUs(in, groupOf)
+	if !ok {
+		t.Fatal("expected groups")
+	}
+	want := []int{129, 130, 131, 132, 133, 134, 135, 136}
+	if len(out) != len(want) {
+		t.Fatalf("len %d", len(out))
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("order %v", out)
+		}
+	}
+	if len(labels) != 2 || labels[0] != "128-135" || labels[1] != "136-143" {
+		t.Fatalf("labels %v", labels)
+	}
+}
+
 func TestLayoutCPUsLiveSysfs(t *testing.T) {
 	in := []int{0, 1, 2, 3}
 	out, _ := LayoutCPUs(in)

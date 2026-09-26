@@ -55,15 +55,16 @@ type TxView struct {
 	coinbase common.Address
 	rules    params.Rules
 
-	accs    map[common.Address]*localAcct
-	mv      map[Key]ReadResult // first read of a key in this attempt
-	early   bool               // publish final-looking hot writes before tx end
-	wcount  map[Key]int        // writes per key, only when early
-	readSeq int
-	regions int
-	pass    []Key
-	wrote   []Key
-	occ     []OccRead
+	accs     map[common.Address]*localAcct
+	mv       map[Key]ReadResult // first read of a key in this attempt
+	early    bool               // publish final-looking hot writes before tx end
+	parallel bool               // more than one worker; C=1 skips fence and abort loads
+	wcount   map[Key]int        // writes per key, only when early
+	readSeq  int
+	regions  int
+	pass     []Key
+	wrote    []Key
+	occ      []OccRead
 
 	ownFee  *uint256.Int
 	feeSum  *uint256.Int // lower-tx fees captured with the coinbase read
@@ -105,6 +106,11 @@ type localAcct struct {
 	storage      map[common.Hash]common.Hash
 	storageOrig  map[common.Hash]common.Hash
 	storageDirty map[common.Hash]struct{}
+
+	// wipeTx is the transaction that wiped this account, or -1. It is
+	// filled once per attempt so later slots do not read WipeKey again.
+	wipeKnown bool
+	wipeTx    int
 }
 
 var viewPool = sync.Pool{New: func() any {
@@ -132,7 +138,11 @@ func NewTxView(mode Mode, tx int, attempt uint64, ffUntil int, store *Store, led
 	v.deps = deps
 	v.abort = abort
 	v.coinbase = coinbase
-	v.early = mode == ModeRF && deps != nil && deps.Parallel()
+	// Snapshot parallelism once. deps.Parallel takes the scheduler lock;
+	// calling it on every read was per-op bookkeeping, and a C=1 attempt
+	// never needs the fence or the abort flag.
+	v.parallel = deps != nil && deps.Parallel()
+	v.early = mode == ModeRF && v.parallel
 	if v.ownFee == nil {
 		v.ownFee = uint256.NewInt(0)
 	} else {
@@ -164,6 +174,7 @@ func (v *TxView) recycle() {
 	clear(v.mv)
 	clear(v.wcount)
 	v.early = false
+	v.parallel = false
 	v.pass = v.pass[:0]
 	v.wrote = v.wrote[:0]
 	v.occ = v.occ[:0]
@@ -206,7 +217,7 @@ func (v *TxView) CoinbaseObserved() (total, feeSum *uint256.Int) {
 func (v *TxView) OwnFee() *uint256.Int { return new(uint256.Int).Set(v.ownFee) }
 
 func (v *TxView) guard() {
-	if v.mode == ModeDirect || v.abort == nil {
+	if !v.parallel || v.mode == ModeDirect || v.abort == nil {
 		return
 	}
 	if v.abort.Load() {
@@ -275,10 +286,12 @@ func (v *TxView) readMV(k Key, doFence bool) ReadResult {
 	if res, ok := v.mv[k]; ok {
 		return res
 	}
-	v.guard()
+	if v.parallel {
+		v.guard()
+	}
 	seq := v.readSeq
 	v.readSeq++
-	if doFence && seq >= v.ffUntil {
+	if v.parallel && doFence && seq >= v.ffUntil {
 		v.fence(k, seq)
 	}
 	register := v.mode == ModeRF && !v.isCoinbaseBal(k)
@@ -751,7 +764,9 @@ func (v *TxView) GetState(addr common.Address, hash common.Hash) common.Hash {
 			return val
 		}
 	}
-	v.guard()
+	if v.parallel {
+		v.guard()
+	}
 	a := v.acct(addr)
 	a.slots()
 	if val, ok := a.storage[hash]; ok {
@@ -763,14 +778,8 @@ func (v *TxView) GetState(addr common.Address, hash common.Hash) common.Hash {
 		a.storageOrig[hash] = common.Hash{}
 		return common.Hash{}
 	}
-	wipe := v.readMV(WipeKey(addr), true)
+	wipeTx := v.cachedWipe(addr, a)
 	slotRes := v.readMV(SlotKeyOf(addr, hash), true)
-	wipeTx := -1
-	if wipe.FromVersion && decBool(wipe.Data) {
-		wipeTx = wipe.ObsTx
-	} else if v.mode == ModeDirect && v.store.Wiped(addr) {
-		wipeTx = 0 // mask prestate; direct writes are in the local map
-	}
 	var val common.Hash
 	slotTx := -1
 	if slotRes.FromVersion {
@@ -785,6 +794,24 @@ func (v *TxView) GetState(addr common.Address, hash common.Hash) common.Hash {
 	a.storage[hash] = val
 	a.storageOrig[hash] = val
 	return val
+}
+
+// cachedWipe reads the account wipe once per attempt and keeps it on the
+// local account. Later slots of the same account skip that ledger read.
+func (v *TxView) cachedWipe(addr common.Address, a *localAcct) int {
+	if a.wipeKnown {
+		return a.wipeTx
+	}
+	wipe := v.readMV(WipeKey(addr), true)
+	wipeTx := -1
+	if wipe.FromVersion && decBool(wipe.Data) {
+		wipeTx = wipe.ObsTx
+	} else if v.mode == ModeDirect && v.store != nil && v.store.Wiped(addr) {
+		wipeTx = 0 // mask prestate; direct writes are in the local map
+	}
+	a.wipeTx = wipeTx
+	a.wipeKnown = true
+	return wipeTx
 }
 
 func (v *TxView) SetState(addr common.Address, key, value common.Hash) common.Hash {

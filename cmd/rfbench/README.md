@@ -54,9 +54,9 @@ setup, not an engine warm-up. Engine state is still fresh on every timed run.
 
 ```sh
 # this VM (4 cores). Pass both fixture trees; they are sorted by block number.
-# With GOMAXPROCS unset, the process sets it to the largest -c (here 8).
-# rf-auto ignores -c. Its maximum is the pin list, and the process lowers
-# GOMAXPROCS to the active trial for the duration of each block.
+# With GOMAXPROCS unset, the process sets it once to the largest -c (here 8).
+# rf-auto ignores -c. Its maximum is the pin list. GOMAXPROCS stays at that
+# cap; the pool gates how many workers take tasks.
 GOGC=100 ./rfbench \
   -fixtures /path/to/fixa,/path/to/fixb \
   -engines serial,occ,rf,rf-auto \
@@ -71,17 +71,23 @@ GOGC=100 ./rfbench \
 256-core host, pinned to CPUs 128-255. Run **one process per engine and
 C**, with `GOMAXPROCS=C`. The CPU list is only the pin mask: it does not
 raise `GOMAXPROCS` or the number of worker threads. If `GOMAXPROCS` is unset,
-the process sets it to the largest `-c` value. `rf-auto` is one process
-whose `GOMAXPROCS` starts at the pin-list length; each block then sets
-`GOMAXPROCS` to the active trial and restores it afterwards.
+the process sets it once to the largest `-c` value and does not change it
+again. `rf-auto` is one process whose `GOMAXPROCS` is the pin-list length
+when the variable is unset. Inactive workers wait on the pool; the process
+does not call `GOMAXPROCS` per trial.
 
 The pin list is compacted by last-level cache before workers start. The
 group key is `shared_cpu_list` of the highest-index cache under
 `/sys/devices/system/cpu/cpuN/cache`. On the EPYC hosts used for the scan
 that list is a CCX (eight CPUs); the size is read from sysfs and is not
-hardcoded. Groups are ordered by their smallest CPU id, so active workers
-`0..k-1` share as few groups as possible. Missing sysfs keeps the given
-order. The stderr line `groups=` prints one label per group in pin order.
+hardcoded. Groups are ordered by their smallest CPU id, and CPUs inside a
+group are sorted. `NewPool` pins worker `i` to `ordered[i % len]`. The
+active set is workers `0..k-1`, so it is a prefix of that list and fills
+one cache before spilling. A list such as 129-136, which straddles
+128-135 and 136-143, is reordered so 129-135 come first and 136 is last.
+Missing sysfs keeps the given order, and worker `i` is then pinned to the
+caller's `i`-th CPU. The stderr line `groups=` prints one label per group
+in that pin order.
 
 ```sh
 cpus=$(seq -s, 128 255)
@@ -131,28 +137,41 @@ global hot set.
 ### Learned worker count (`rf-auto`)
 
 `-c` does not apply. One run per block uses at most as many workers as the
-pin list (also capped by `GOMAXPROCS` at process start, so an explicit
+pin list (also capped by `GOMAXPROCS`, which is only read, so an explicit
 `GOMAXPROCS=1` stays at one). Inactive workers leave the scheduler and wait
-on the pool condition; they are not parked inside `Step`.
+on the pool condition; they are not parked inside `Step`. The process does
+not change `GOMAXPROCS` when the active count changes. A deferred update
+carries the `Drive` generation and is ignored once the next block has
+started, so a late shrink cannot leave the pool at one worker.
 
-The active count is a hill-climb trial. It is capped by the structural
-width (how many distinct senders still have a non-final transaction) and by
-that process limit. The cross-block prior is only the starting trial: a
-cold prior of 0 starts at 1 and may step up, and a prior of 4 may step to 5
-when the width allows. It is not a third minimum. The next block's prior is
-the trial with the highest measured gas per nanosecond (`CrewBest`), taken
-from the last timed auto run of the block. K runs all start from the same
-pre-block prior.
+The active count starts at the cross-block prior, capped by the structural
+width and by that process limit. The width is the number of transactions
+from the frontier onward that are ready or running, not parked on a fence,
+and not blocked on an earlier transaction from the same sender. It is not
+the number of remaining distinct senders. A cold prior of 0 starts at 1.
+The next block's prior is `CrewBest`: the capped prior, or the trial with
+the highest measured gas per nanosecond if a window closed. K runs all
+start from the same pre-block prior. Tail drain may shrink the active
+count (the trace can still end at 1) but it does not change `CrewBest`.
 
-Samples are equal-gas intervals. The first completed transaction sets the
-quantum and is only a baseline. A faster interval keeps the direction. A
-slower one steps back to the best trial and stops. The watchdog shrinks
-when the interval has more aborts than completions, or when summed idle
-time exceeds the wall time of every extra worker, and then stays at the
-reduced trial for the rest of the block. A burst of aborts with no
-completion, one per active worker, shrinks before the quantum fills. As
-senders finish, the structural width falls and the active count follows it,
-so the trace often ends at 1 even when the measured best trial was higher.
+Samples are per-completion gas per wall nanosecond. A window closes after
+one completion per active worker (at least two), once the standard error
+is at most half the mean. A noisy pair stays open until more completions
+shrink that error. The point estimate is gas over wall time for the whole
+window, not the mean of the per-completion rates. Two windows at the
+starting count form the baseline, and the bar is the faster of the two. A
+later slower slice at that same count does not lower the bar. A probe that
+beats the bar by more than the sum of the two standard errors records that
+trial and doubles (or halves, when already at the cap). A probe that is
+slower, or only inside that noise, returns to the best trial at once and
+refines by one worker on the next window at that trial; if that step is
+slower, it tries the other direction once. A window already at the best
+trial that is inside the noise does not move, unless that refinement step
+is still pending. The watchdog halves the active count on an abort storm
+(no completion and at least one abort per active worker, or more aborts
+than completions in a closed window) or on sustained idle while the
+frontier is still wide enough, and that block does not climb back. The
+shrink does not change the recorded best, so the next block retries it.
 
 Early publication of a storage slot or nonce runs only when more than one
 worker is active and the key is fenced with more single-write attempts than
@@ -215,9 +234,10 @@ nonce or estimate miss parks on the lower transaction.
   Abandoned attempts retract the early version; there is no separate
   cascade for values derived from it beyond that invalidation.
 - No ORDER hand-off.
-- Learned C is a one-dimensional hill climb on equal-gas throughput, capped
-  by sender width, plus an abort/idle watchdog. It is not a fitted model of
-  critical-path width.
+- Learned C is a multiplicative hill climb on gas per nanosecond, capped
+  by the ready-transaction frontier, plus an abort/idle watchdog. It is
+  not a fitted model of critical-path width. Tail drain does not become
+  the next block's prior.
 - Rollback restarts the transaction and fast-forwards by read sequence.
   Fast-forward skips waits; it still re-registers readers. Interpreter
   frames are not restored from the snapshot.

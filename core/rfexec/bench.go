@@ -57,7 +57,7 @@ var CSVHeader = []string{
 // rf-auto keeps a separate worker-count prior. Each timed auto run of a
 // block starts from the pre-block best trial (0 on the first block). K runs
 // are not chained. After the block, the prior becomes that last run's
-// measured-best trial.
+// CrewBest: the best body trial, not the width left by tail drain.
 func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rfstate.Pool, prior string, out io.Writer) error {
 	if runs < 1 {
 		runs = 1

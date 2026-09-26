@@ -26,92 +26,229 @@ func TestCrewWidthOneNeverGrows(t *testing.T) {
 	if got := c.begin(1); got != 1 {
 		t.Fatalf("start %d", got)
 	}
-	if n, ch := c.tick(100, 0, 0, 1); n != 1 || ch {
-		t.Fatalf("after baseline %d changed %v", n, ch)
+	if c.Best() != 1 {
+		t.Fatalf("best %d", c.Best())
 	}
-	if n, _ := c.tick(100, 0, 0, 1); n != 1 {
-		t.Fatalf("grew to %d", n)
+	cur := time.Unix(1_000, 0)
+	c.now = func() time.Time { return cur }
+	c.winStart = cur
+	c.lastSample = cur
+	cur = cur.Add(10 * time.Millisecond)
+	if n, ch := c.tick(100, 0, 0, 1); n != 1 || ch {
+		t.Fatalf("first %d changed %v", n, ch)
+	}
+	cur = cur.Add(10 * time.Millisecond)
+	if n, ch := c.tick(100, 0, 0, 1); n != 1 || ch {
+		t.Fatalf("grew to %d changed %v", n, ch)
 	}
 }
 
-func TestCrewPriorIsStartNotCeiling(t *testing.T) {
-	cur := time.Unix(1_000, 0)
-	c := newCrew(4, 8)
-	c.now = func() time.Time { return cur }
-	if got := c.begin(8); got != 4 {
+func TestCrewPriorStartsAtPrior(t *testing.T) {
+	c := newCrew(4, 32)
+	if got := c.begin(32); got != 4 {
 		t.Fatalf("start %d", got)
 	}
-	// Faster interval than the baseline: the prior is not a cap.
-	cur = cur.Add(10 * time.Millisecond)
-	n, ch := c.tick(100, 0, 0, 1)
-	if !ch || n != 5 {
-		t.Fatalf("probe up got %d changed %v", n, ch)
-	}
-	cur = cur.Add(5 * time.Millisecond)
-	n, ch = c.tick(100, 0, 0, 1)
-	if !ch || n != 6 {
-		t.Fatalf("continue got %d changed %v", n, ch)
-	}
-	if c.Best() != 5 {
+	if c.Best() != 4 {
 		t.Fatalf("best %d", c.Best())
 	}
 }
 
-func TestCrewAbortStormShrinks(t *testing.T) {
-	c := newCrew(4, 8)
-	if c.begin(8) != 4 {
-		t.Fatal(c.active)
-	}
-	n, ch := c.tick(100, 0, 3, 1)
-	if !ch || n != 3 {
-		t.Fatalf("storm got %d changed %v", n, ch)
-	}
-	// A later faster interval must not climb back into the storm.
-	if n, ch := c.tick(100, 0, 0, 1); n != 3 || ch {
-		t.Fatalf("climbed after storm to %d changed %v", n, ch)
-	}
-}
-
-func TestCrewIdleStormShrinks(t *testing.T) {
-	cur := time.Unix(2_000, 0)
-	c := newCrew(4, 8)
-	c.now = func() time.Time { return cur }
-	c.begin(8)
-	cur = cur.Add(10 * time.Millisecond)
-	// Three extra workers idle for the whole 10ms, plus a bit.
-	idle := int64(10*time.Millisecond)*3 + 1
-	n, ch := c.tick(100, idle, 0, 1)
-	if !ch || n != 3 {
-		t.Fatalf("idle got %d changed %v", n, ch)
-	}
-}
-
-func TestCrewWorseStepsBackAndStops(t *testing.T) {
-	cur := time.Unix(3_000, 0)
-	c := newCrew(1, 4)
-	c.now = func() time.Time { return cur }
-	c.begin(4)
-	cur = cur.Add(10 * time.Millisecond)
-	if n, _ := c.tick(100, 0, 0, 1); n != 2 {
-		t.Fatalf("probe %d", n)
-	}
-	cur = cur.Add(5 * time.Millisecond)
-	if n, _ := c.tick(100, 0, 0, 1); n != 3 {
-		t.Fatalf("continue %d", n)
-	}
-	// Slower than C=2: step back to the measured best and stop.
-	cur = cur.Add(40 * time.Millisecond)
-	n, ch := c.tick(100, 0, 0, 1)
-	if !ch || n != 2 {
-		t.Fatalf("back %d changed %v trace %s", n, ch, c.Trace())
-	}
-	if c.dir != 0 {
-		t.Fatalf("dir %d", c.dir)
+func TestCrewWidthCapsPrior(t *testing.T) {
+	c := newCrew(8, 32)
+	if got := c.begin(2); got != 2 {
+		t.Fatalf("start %d", got)
 	}
 	if c.Best() != 2 {
 		t.Fatalf("best %d", c.Best())
 	}
-	if c.Trace() != "1-2-3-2" {
+}
+
+// window closes one window: one completion per active worker, at least two.
+func window(c *crew, cur *time.Time, dt time.Duration, gas uint64) (int, bool) {
+	n := c.active
+	if n < 2 {
+		n = 2
+	}
+	var got int
+	var ch bool
+	for i := 0; i < n; i++ {
+		*cur = cur.Add(dt)
+		got, ch = c.tick(gas, 0, 0, 1)
+	}
+	return got, ch
+}
+
+func TestCrewDoublesOnFaster(t *testing.T) {
+	cur := time.Unix(1_000, 0)
+	c := newCrew(4, 32)
+	c.now = func() time.Time { return cur }
+	if got := c.begin(32); got != 4 {
+		t.Fatalf("start %d", got)
+	}
+	if n, ch := window(c, &cur, 10*time.Millisecond, 100); ch || n != 4 {
+		t.Fatalf("first baseline %d changed %v", n, ch)
+	}
+	if n, ch := window(c, &cur, 10*time.Millisecond, 100); !ch || n != 8 {
+		t.Fatalf("double %d changed %v trace %s", n, ch, c.Trace())
+	}
+	if c.Best() != 4 {
+		t.Fatalf("best after baseline %d", c.Best())
+	}
+	if n, ch := window(c, &cur, 5*time.Millisecond, 100); !ch || n != 16 {
+		t.Fatalf("double again %d changed %v trace %s", n, ch, c.Trace())
+	}
+	if c.Best() != 8 {
+		t.Fatalf("best %d", c.Best())
+	}
+}
+
+func TestCrewSlowerRefines(t *testing.T) {
+	cur := time.Unix(3_000, 0)
+	c := newCrew(4, 32)
+	c.now = func() time.Time { return cur }
+	c.begin(32)
+	window(c, &cur, 10*time.Millisecond, 100)
+	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
+		t.Fatalf("probe %d", n)
+	}
+	if n, ch := window(c, &cur, 40*time.Millisecond, 100); !ch || n != 4 {
+		t.Fatalf("back %d changed %v trace %s", n, ch, c.Trace())
+	}
+	n, ch := window(c, &cur, 10*time.Millisecond, 100)
+	if !ch || n != 5 {
+		t.Fatalf("refine %d changed %v trace %s", n, ch, c.Trace())
+	}
+	if c.Trace() != "4-8-4-5" {
+		t.Fatalf("trace %s", c.Trace())
+	}
+	if c.Best() != 4 {
+		t.Fatalf("best %d", c.Best())
+	}
+}
+
+func TestCrewNoiseStays(t *testing.T) {
+	cur := time.Unix(4_000, 0)
+	c := newCrew(4, 32)
+	c.now = func() time.Time { return cur }
+	c.begin(32)
+	window(c, &cur, 10*time.Millisecond, 100)
+	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
+		t.Fatalf("probe %d", n)
+	}
+	// The same rate is not a clear improvement, so the probe returns.
+	n, ch := window(c, &cur, 10*time.Millisecond, 100)
+	if !ch || n != 4 {
+		t.Fatalf("noise stayed at %d changed %v trace %s", n, ch, c.Trace())
+	}
+	if c.Best() != 4 {
+		t.Fatalf("best %d", c.Best())
+	}
+}
+
+func TestCrewAbortStorm(t *testing.T) {
+	cur := time.Unix(5_000, 0)
+	c := newCrew(4, 8)
+	c.now = func() time.Time { return cur }
+	if c.begin(8) != 4 {
+		t.Fatal(c.active)
+	}
+	n, ch := c.tick(0, 0, 4, 0)
+	if !ch || n != 2 {
+		t.Fatalf("storm got %d changed %v", n, ch)
+	}
+	if c.Best() != 4 {
+		t.Fatalf("storm rewrote best to %d", c.Best())
+	}
+	cur = cur.Add(time.Millisecond)
+	c.tick(100, 0, 0, 1)
+	cur = cur.Add(time.Millisecond)
+	if n, ch := c.tick(100, 0, 0, 1); n != 2 || ch {
+		t.Fatalf("climbed after storm to %d changed %v", n, ch)
+	}
+	if c.Best() != 4 {
+		t.Fatalf("best after fast window %d", c.Best())
+	}
+}
+
+func TestCrewIdleStorm(t *testing.T) {
+	cur := time.Unix(2_000, 0)
+	c := newCrew(4, 8)
+	c.now = func() time.Time { return cur }
+	c.begin(8)
+	// One completion per worker closes the window. Idle of each sample is
+	// just over (active-1) times 10ms, so the sum exceeds elapsed*(active-1).
+	idle := int64(10*time.Millisecond)*3 + 1
+	var n int
+	var ch bool
+	for i := 0; i < 3; i++ {
+		cur = cur.Add(10 * time.Millisecond)
+		if n, ch = c.tick(100, idle, 0, 1); ch || n != 4 {
+			t.Fatalf("sample %d got %d changed %v", i, n, ch)
+		}
+	}
+	cur = cur.Add(10 * time.Millisecond)
+	n, ch = c.tick(100, idle, 0, 1)
+	if !ch || n != 2 {
+		t.Fatalf("idle got %d changed %v", n, ch)
+	}
+}
+
+func TestCrewTailDrainKeepsBest(t *testing.T) {
+	cur := time.Unix(6_000, 0)
+	c := newCrew(4, 32)
+	c.now = func() time.Time { return cur }
+	c.begin(32)
+	window(c, &cur, 10*time.Millisecond, 100)
+	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
+		t.Fatalf("probe %d", n)
+	}
+	n, ch := c.setWidth(1)
+	if !ch || n != 1 {
+		t.Fatalf("drain %d changed %v", n, ch)
+	}
+	if c.Best() != 4 {
+		t.Fatalf("best after drain %d", c.Best())
+	}
+	cur = cur.Add(10 * time.Millisecond)
+	if n, ch := c.tick(100, 0, 0, 1); ch || n != 1 {
+		t.Fatalf("tail tick %d changed %v", n, ch)
+	}
+	cur = cur.Add(5 * time.Millisecond)
+	if n, ch := c.tick(100, 0, 0, 1); ch || n != 1 || c.Best() != 4 {
+		t.Fatalf("tail moved active %d best %d changed %v", n, c.Best(), ch)
+	}
+	n, ch = c.setWidth(32)
+	if !ch || n != 4 {
+		t.Fatalf("restore %d changed %v", n, ch)
+	}
+	if c.Best() != 4 {
+		t.Fatalf("best %d", c.Best())
+	}
+}
+
+func TestCrewRefineTriesOtherSide(t *testing.T) {
+	cur := time.Unix(7_000, 0)
+	c := newCrew(4, 32)
+	c.now = func() time.Time { return cur }
+	c.begin(32)
+	window(c, &cur, 10*time.Millisecond, 100)
+	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 8 {
+		t.Fatalf("probe %d", n)
+	}
+	if n, _ := window(c, &cur, 40*time.Millisecond, 100); n != 4 {
+		t.Fatalf("back %d trace %s", n, c.Trace())
+	}
+	if n, _ := window(c, &cur, 10*time.Millisecond, 100); n != 5 {
+		t.Fatalf("refine up %d trace %s", n, c.Trace())
+	}
+	if n, _ := window(c, &cur, 40*time.Millisecond, 100); n != 4 {
+		t.Fatalf("refine back %d trace %s", n, c.Trace())
+	}
+	n, ch := window(c, &cur, 10*time.Millisecond, 100)
+	if !ch || n != 3 {
+		t.Fatalf("other side %d changed %v trace %s", n, ch, c.Trace())
+	}
+	if c.Trace() != "4-8-4-5-4-3" {
 		t.Fatalf("trace %s", c.Trace())
 	}
 }
