@@ -239,6 +239,18 @@ func (evm *EVM) SetTxContext(txCtx TxContext) {
 	evm.TxContext = txCtx
 }
 
+// PrepareTx points this EVM at another transaction. One EVM is reused by a
+// single worker across the block; Cancel from the previous attempt is cleared.
+// The EVM is not safe for concurrent use.
+func (evm *EVM) PrepareTx(statedb StateDB, txCtx TxContext) {
+	evm.StateDB = statedb
+	evm.SetTxContext(txCtx)
+	evm.abort.Store(false)
+	evm.returnData = nil
+	evm.readOnly = false
+	evm.depth = 0
+}
+
 // Cancel cancels any running EVM operation. This may be called concurrently and
 // it's safe to be called multiple times.
 func (evm *EVM) Cancel() {

@@ -17,6 +17,7 @@
 package rfstate
 
 import (
+	"runtime"
 	"sort"
 	"sync"
 
@@ -39,12 +40,16 @@ type ReadResult struct {
 	ObsTx       int
 	Estimate    bool
 	EstTx       int
+	// CodeHash is set for a code version. It is cached at publish so a later
+	// load does not recompute keccak.
+	CodeHash common.Hash
 }
 
 type version struct {
 	tx       int
 	data     []byte
 	estimate bool
+	codeHash common.Hash
 }
 
 type reader struct {
@@ -54,18 +59,32 @@ type reader struct {
 }
 
 type keyState struct {
-	mu      sync.Mutex
-	vers    []version
-	readers []reader
+	mu        sync.Mutex
+	vers      []version
+	readers   []reader
+	producers []int // txs that published this key and have not dropped it
+}
+
+// touchSet is the read set and write set of one transaction. DropEstimates,
+// RemoveReaders, Retract and MarkEstimate visit only these keys.
+type touchSet struct {
+	reads  map[Key]struct{}
+	writes map[Key]struct{}
+}
+
+type keyShard struct {
+	mu   sync.Mutex
+	keys map[Key]*keyState
 }
 
 // Ledger is the per-key multi-version memory and reader registry.
 // Writes publish at transaction finish (AT_FINISH). A published write
 // invalidates higher-index readers that observed an older version.
+// The key index is sharded so a read or publish does not take a process-wide lock.
 type Ledger struct {
-	mu      sync.Mutex
-	keys    map[Key]*keyState
-	writers map[Key][]int // txs that have published this key at least once
+	shards []keyShard
+	mask   uint32
+	touch  []touchSet
 
 	feeMu sync.Mutex
 	fees  []*uint256.Int
@@ -74,26 +93,73 @@ type Ledger struct {
 	learner      *Learner
 }
 
+// ledgerStripes is one stripe per GOMAXPROCS, rounded up to a power of two.
+// The count follows the process, it is not a tuned constant.
+func ledgerStripes() int {
+	n := runtime.GOMAXPROCS(0)
+	if n < 1 {
+		n = 1
+	}
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
+}
+
 // NewLedger returns an empty ledger sized for n transactions.
 func NewLedger(n int, learner *Learner, onInvalidate func(Victim)) *Ledger {
-	return &Ledger{
-		keys:         map[Key]*keyState{},
-		writers:      map[Key][]int{},
+	stripes := ledgerStripes()
+	l := &Ledger{
+		shards:       make([]keyShard, stripes),
+		mask:         uint32(stripes - 1),
+		touch:        make([]touchSet, n),
 		fees:         make([]*uint256.Int, n),
 		onInvalidate: onInvalidate,
 		learner:      learner,
 	}
+	for i := range l.shards {
+		l.shards[i].keys = map[Key]*keyState{}
+	}
+	for i := range l.touch {
+		l.touch[i].reads = map[Key]struct{}{}
+		l.touch[i].writes = map[Key]struct{}{}
+	}
+	return l
 }
 
 func (l *Ledger) state(k Key) *keyState {
-	l.mu.Lock()
-	ks := l.keys[k]
+	sh := &l.shards[k.stripe(l.mask)]
+	sh.mu.Lock()
+	ks := sh.keys[k]
 	if ks == nil {
 		ks = &keyState{}
-		l.keys[k] = ks
+		sh.keys[k] = ks
 	}
-	l.mu.Unlock()
+	sh.mu.Unlock()
 	return ks
+}
+
+func (l *Ledger) existing(k Key) *keyState {
+	sh := &l.shards[k.stripe(l.mask)]
+	sh.mu.Lock()
+	ks := sh.keys[k]
+	sh.mu.Unlock()
+	return ks
+}
+
+func (l *Ledger) noteRead(tx int, k Key) {
+	if tx < 0 || tx >= len(l.touch) {
+		return
+	}
+	l.touch[tx].reads[k] = struct{}{}
+}
+
+func (l *Ledger) noteWrite(tx int, k Key) {
+	if tx < 0 || tx >= len(l.touch) {
+		return
+	}
+	l.touch[tx].writes[k] = struct{}{}
 }
 
 // Read returns the latest version written by a transaction strictly below tx.
@@ -102,7 +168,6 @@ func (l *Ledger) state(k Key) *keyState {
 func (l *Ledger) Read(tx int, attempt uint64, k Key, register bool) ReadResult {
 	ks := l.state(k)
 	ks.mu.Lock()
-	defer ks.mu.Unlock()
 	latest := -1
 	for i := range ks.vers {
 		if ks.vers[i].tx < tx && (latest < 0 || ks.vers[i].tx > ks.vers[latest].tx) {
@@ -115,14 +180,21 @@ func (l *Ledger) Read(tx int, attempt uint64, k Key, register bool) ReadResult {
 		if v.estimate {
 			res.Estimate = true
 			res.EstTx = v.tx
+			ks.mu.Unlock()
 			return res
 		}
+		// Version bytes are immutable after publish. Callers must not write them.
 		res.FromVersion = true
-		res.Data = append([]byte(nil), v.data...)
+		res.Data = v.data
 		res.ObsTx = v.tx
+		res.CodeHash = v.codeHash
 	}
 	if register {
 		ks.readers = append(ks.readers, reader{tx: tx, attempt: attempt, obsTx: res.ObsTx})
+	}
+	ks.mu.Unlock()
+	if register {
+		l.noteRead(tx, k)
 	}
 	return res
 }
@@ -134,21 +206,28 @@ func (l *Ledger) Read(tx int, attempt uint64, k Key, register bool) ReadResult {
 func (l *Ledger) Publish(tx int, k Key, data []byte, estimate bool, base []byte) (changed bool) {
 	ks := l.state(k)
 	ks.mu.Lock()
+	// Own the bytes. Version slices are then immutable and reads can share them.
 	data = append([]byte(nil), data...)
-	prev := append([]byte(nil), base...)
+	var codeHash common.Hash
+	if k.Kind == KindCode {
+		codeHash = CodeHash(true, data)
+	}
+	prev := base
 	replaced := false
 	for i := range ks.vers {
 		if ks.vers[i].tx == tx {
-			prev = append([]byte(nil), ks.vers[i].data...)
+			prev = ks.vers[i].data
 			ks.vers[i].data = data
 			ks.vers[i].estimate = estimate
+			ks.vers[i].codeHash = codeHash
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
-		ks.vers = append(ks.vers, version{tx: tx, data: data, estimate: estimate})
+		ks.vers = append(ks.vers, version{tx: tx, data: data, estimate: estimate, codeHash: codeHash})
 	}
+	noteProducer(ks, tx)
 	changed = estimate || !bytesEqual(prev, data)
 	var victims []Victim
 	if !estimate {
@@ -166,20 +245,9 @@ func (l *Ledger) Publish(tx int, k Key, data []byte, estimate bool, base []byte)
 			victims = append(victims, Victim{Tx: r.tx, Attempt: r.attempt, Key: k})
 		}
 	}
-	// Drop reader entries that belong to finalized-looking duplicates of this tx.
-	if len(ks.readers) > 4096 {
-		dst := ks.readers[:0]
-		for _, r := range ks.readers {
-			if r.tx == tx {
-				continue
-			}
-			dst = append(dst, r)
-		}
-		ks.readers = dst
-	}
 	ks.mu.Unlock()
 
-	l.noteWriter(k, tx)
+	l.noteWrite(tx, k)
 	if len(victims) > 0 && l.learner != nil {
 		l.learner.ObserveConflict(k)
 	}
@@ -198,15 +266,16 @@ func (l *Ledger) Publish(tx int, k Key, data []byte, estimate bool, base []byte)
 // forever (the producer is already settled, but the read still blocks).
 // Readers that observed the removed version are invalidated.
 func (l *Ledger) DropEstimates(tx int) {
-	l.mu.Lock()
-	keys := make([]Key, 0, len(l.keys))
-	states := make([]*keyState, 0, len(l.keys))
-	for k, ks := range l.keys {
-		keys = append(keys, k)
-		states = append(states, ks)
+	if tx < 0 || tx >= len(l.touch) {
+		return
 	}
-	l.mu.Unlock()
-	for i, ks := range states {
+	writes := l.touch[tx].writes
+	for k := range writes {
+		ks := l.existing(k)
+		if ks == nil {
+			delete(writes, k)
+			continue
+		}
 		ks.mu.Lock()
 		had := false
 		dst := ks.vers[:0]
@@ -222,7 +291,7 @@ func (l *Ledger) DropEstimates(tx int) {
 		if had {
 			for _, r := range ks.readers {
 				if r.tx > tx && r.obsTx == tx {
-					victims = append(victims, Victim{Tx: r.tx, Attempt: r.attempt, Key: keys[i]})
+					victims = append(victims, Victim{Tx: r.tx, Attempt: r.attempt, Key: k})
 				}
 			}
 		}
@@ -233,47 +302,28 @@ func (l *Ledger) DropEstimates(tx int) {
 				break
 			}
 		}
+		if !still {
+			dropProducer(ks, tx)
+		}
 		ks.mu.Unlock()
-		if had && !still {
-			l.forgetWriter(keys[i], tx)
+		if !still {
+			delete(writes, k)
 		}
-		if len(victims) > 0 && l.learner != nil {
-			l.learner.ObserveConflict(keys[i])
-		}
-		if l.onInvalidate != nil {
-			for _, v := range victims {
-				l.onInvalidate(v)
-			}
-		}
+		l.fire(k, victims)
 	}
 }
 
-func (l *Ledger) forgetWriter(k Key, tx int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	ws := l.writers[k]
-	dst := make([]int, 0, len(ws))
-	for _, w := range ws {
-		if w != tx {
-			dst = append(dst, w)
-		}
-	}
-	if len(dst) == 0 {
-		delete(l.writers, k)
+// MarkEstimate turns this transaction's published versions into ESTIMATE
+// markers so higher readers block. Keys it has not written are left alone.
+func (l *Ledger) MarkEstimate(tx int) {
+	if tx < 0 || tx >= len(l.touch) {
 		return
 	}
-	l.writers[k] = dst
-}
-
-// MarkEstimate turns every version of tx into an ESTIMATE so higher readers block.
-func (l *Ledger) MarkEstimate(tx int) {
-	l.mu.Lock()
-	keys := make([]*keyState, 0, len(l.keys))
-	for _, ks := range l.keys {
-		keys = append(keys, ks)
-	}
-	l.mu.Unlock()
-	for _, ks := range keys {
+	for k := range l.touch[tx].writes {
+		ks := l.existing(k)
+		if ks == nil {
+			continue
+		}
 		ks.mu.Lock()
 		for i := range ks.vers {
 			if ks.vers[i].tx == tx {
@@ -286,23 +336,22 @@ func (l *Ledger) MarkEstimate(tx int) {
 
 // Retract removes tx's versions and invalidates readers that observed them (R3).
 func (l *Ledger) Retract(tx int) {
-	l.mu.Lock()
-	keys := make([]Key, 0, len(l.keys))
-	states := make([]*keyState, 0, len(l.keys))
-	for k, ks := range l.keys {
-		keys = append(keys, k)
-		states = append(states, ks)
+	if tx < 0 || tx >= len(l.touch) {
+		return
 	}
-	l.mu.Unlock()
-	for i, ks := range states {
+	// Keep the write set so the incarnation can drop keys it does not republish.
+	writes := l.touch[tx].writes
+	for k := range writes {
+		ks := l.existing(k)
+		if ks == nil {
+			continue
+		}
 		ks.mu.Lock()
 		had := false
 		dst := ks.vers[:0]
-		var removed []byte
 		for _, v := range ks.vers {
 			if v.tx == tx {
 				had = true
-				removed = v.data
 				continue
 			}
 			dst = append(dst, v)
@@ -312,12 +361,10 @@ func (l *Ledger) Retract(tx int) {
 		if had {
 			for _, r := range ks.readers {
 				if r.tx > tx && r.obsTx == tx {
-					victims = append(victims, Victim{Tx: r.tx, Attempt: r.attempt, Key: keys[i]})
+					victims = append(victims, Victim{Tx: r.tx, Attempt: r.attempt, Key: k})
 				}
 			}
-			_ = removed
 		}
-		// Forget this tx's own reader entries.
 		rd := ks.readers[:0]
 		for _, r := range ks.readers {
 			if r.tx == tx {
@@ -327,26 +374,22 @@ func (l *Ledger) Retract(tx int) {
 		}
 		ks.readers = rd
 		ks.mu.Unlock()
-		if len(victims) > 0 && l.learner != nil {
-			l.learner.ObserveConflict(keys[i])
-		}
-		if l.onInvalidate != nil {
-			for _, v := range victims {
-				l.onInvalidate(v)
-			}
-		}
+		l.fire(k, victims)
 	}
 }
 
 // RemoveReaders drops reader registrations for one transaction without retracting writes.
 func (l *Ledger) RemoveReaders(tx int) {
-	l.mu.Lock()
-	states := make([]*keyState, 0, len(l.keys))
-	for _, ks := range l.keys {
-		states = append(states, ks)
+	if tx < 0 || tx >= len(l.touch) {
+		return
 	}
-	l.mu.Unlock()
-	for _, ks := range states {
+	reads := l.touch[tx].reads
+	for k := range reads {
+		delete(reads, k)
+		ks := l.existing(k)
+		if ks == nil {
+			continue
+		}
 		ks.mu.Lock()
 		rd := ks.readers[:0]
 		for _, r := range ks.readers {
@@ -359,29 +402,55 @@ func (l *Ledger) RemoveReaders(tx int) {
 	}
 }
 
+func (l *Ledger) fire(k Key, victims []Victim) {
+	if len(victims) == 0 {
+		return
+	}
+	if l.learner != nil {
+		l.learner.ObserveConflict(k)
+	}
+	if l.onInvalidate != nil {
+		for _, v := range victims {
+			l.onInvalidate(v)
+		}
+	}
+}
+
 // LowerProducer is the highest transaction index below tx that has published k.
+// An ESTIMATE version still counts: the producer is re-executing that key.
 func (l *Ledger) LowerProducer(tx int, k Key) (int, bool) {
-	l.mu.Lock()
-	ws := append([]int(nil), l.writers[k]...)
-	l.mu.Unlock()
+	ks := l.existing(k)
+	if ks == nil {
+		return 0, false
+	}
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
 	best := -1
-	for _, w := range ws {
-		if w < tx && w > best {
-			best = w
+	for _, p := range ks.producers {
+		if p < tx && p > best {
+			best = p
 		}
 	}
 	return best, best >= 0
 }
 
-func (l *Ledger) noteWriter(k Key, tx int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, w := range l.writers[k] {
-		if w == tx {
+func noteProducer(ks *keyState, tx int) {
+	for _, p := range ks.producers {
+		if p == tx {
 			return
 		}
 	}
-	l.writers[k] = append(l.writers[k], tx)
+	ks.producers = append(ks.producers, tx)
+}
+
+func dropProducer(ks *keyState, tx int) {
+	dst := ks.producers[:0]
+	for _, p := range ks.producers {
+		if p != tx {
+			dst = append(dst, p)
+		}
+	}
+	ks.producers = dst
 }
 
 // RecordFee stores the transaction-local coinbase fee. It is not a balance write.
@@ -425,14 +494,19 @@ func (l *Ledger) Fee(tx int) *uint256.Int {
 // folded into the balance key; the caller adds them when materialising the
 // coinbase account. Wipe versions clear prestate slots.
 func (l *Ledger) Fold(store *Store, coinbase common.Address) {
-	l.mu.Lock()
-	keys := make([]Key, 0, len(l.keys))
-	states := make([]*keyState, 0, len(l.keys))
-	for k, ks := range l.keys {
-		keys = append(keys, k)
-		states = append(states, ks)
+	type pair struct {
+		key Key
+		ks  *keyState
 	}
-	l.mu.Unlock()
+	var owned []pair
+	for i := range l.shards {
+		sh := &l.shards[i]
+		sh.mu.Lock()
+		for k, ks := range sh.keys {
+			owned = append(owned, pair{k, ks})
+		}
+		sh.mu.Unlock()
+	}
 
 	type folded struct {
 		key  Key
@@ -440,7 +514,8 @@ func (l *Ledger) Fold(store *Store, coinbase common.Address) {
 		tx   int
 	}
 	var rows []folded
-	for i, ks := range states {
+	for _, p := range owned {
+		ks := p.ks
 		ks.mu.Lock()
 		latest := map[int]version{} // one per tx, last wins (there is only one)
 		bestTx := -1
@@ -457,7 +532,7 @@ func (l *Ledger) Fold(store *Store, coinbase common.Address) {
 		}
 		ks.mu.Unlock()
 		if bestTx >= 0 {
-			rows = append(rows, folded{key: keys[i], data: best.data, tx: best.tx})
+			rows = append(rows, folded{key: p.key, data: best.data, tx: best.tx})
 		}
 		_ = latest
 	}
@@ -538,10 +613,16 @@ func (l *Ledger) applyFold(store *Store, k Key, data []byte) {
 // ClearVersions drops multi-version state after a fold. Fees are retained
 // until the ledger is discarded.
 func (l *Ledger) ClearVersions() {
-	l.mu.Lock()
-	l.keys = map[Key]*keyState{}
-	l.writers = map[Key][]int{}
-	l.mu.Unlock()
+	for i := range l.shards {
+		sh := &l.shards[i]
+		sh.mu.Lock()
+		sh.keys = map[Key]*keyState{}
+		sh.mu.Unlock()
+	}
+	for i := range l.touch {
+		clear(l.touch[i].reads)
+		clear(l.touch[i].writes)
+	}
 }
 
 func versionData(vers []version, tx int) []byte {

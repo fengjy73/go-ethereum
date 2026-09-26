@@ -18,6 +18,7 @@ package rfstate
 
 import (
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
@@ -30,11 +31,14 @@ type SlotKey struct {
 }
 
 // Account is an immutable prestate (or folded) account.
+// Code is shared and must not be mutated. CodeHash is the consensus hash of
+// Code, computed when the account is sealed, so callers do not rehash.
 type Account struct {
-	Exists  bool
-	Balance *uint256.Int
-	Nonce   uint64
-	Code    []byte
+	Exists   bool
+	Balance  *uint256.Int
+	Nonce    uint64
+	Code     []byte
+	CodeHash common.Hash
 }
 
 // World is the immutable block pre-state: the union of per-tx prestates,
@@ -109,6 +113,9 @@ func (s *Store) Slot(addr common.Address, slot common.Hash) common.Hash {
 
 // PutAccount replaces the overlay account. The argument is copied.
 func (s *Store) PutAccount(addr common.Address, a Account) {
+	if a.CodeHash == (common.Hash{}) {
+		a.Seal()
+	}
 	c := cloneAccount(&a)
 	s.acc[addr] = &c
 	if !a.Exists {
@@ -188,11 +195,20 @@ func cloneAccount(a *Account) Account {
 		bal.Set(a.Balance)
 	}
 	return Account{
-		Exists:  a.Exists,
-		Balance: bal,
-		Nonce:   a.Nonce,
-		Code:    append([]byte(nil), a.Code...),
+		Exists:   a.Exists,
+		Balance:  bal,
+		Nonce:    a.Nonce,
+		Code:     a.Code,
+		CodeHash: a.CodeHash,
 	}
+}
+
+// Seal caches the code hash. Code bytes are treated as immutable afterwards.
+func (a *Account) Seal() {
+	if a == nil {
+		return
+	}
+	a.CodeHash = CodeHash(a.Exists, a.Code)
 }
 
 // SeedSystemContracts inserts canonical system-contract code when the fixture
@@ -232,21 +248,24 @@ func seedCode(w *World, addr common.Address, code []byte) {
 			nonce = a.Nonce
 		}
 	}
-	w.Accounts[addr] = &Account{
+	acc := &Account{
 		Exists:  exists,
 		Balance: bal,
 		Nonce:   nonce,
-		Code:    append([]byte(nil), code...),
+		Code:    code,
 	}
+	acc.Seal()
+	w.Accounts[addr] = acc
 }
 
 // CodeHash returns the consensus code hash for an account.
+// Empty code uses the protocol empty-code hash; it is not recomputed.
 func CodeHash(exists bool, code []byte) common.Hash {
 	if !exists {
 		return common.Hash{}
 	}
 	if len(code) == 0 {
-		return crypto.Keccak256Hash(nil)
+		return types.EmptyCodeHash
 	}
 	return crypto.Keccak256Hash(code)
 }

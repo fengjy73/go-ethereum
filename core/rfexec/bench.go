@@ -43,11 +43,13 @@ var CSVHeader = []string{
 
 // RunBench executes the requested engines. There is no warm-up. Each timed
 // run builds a fresh state and ledger. With PriorCarry, the learner given to
-// a timed run of block N is a clone of the posterior produced by an untimed
-// RegionFence pass over the earlier fixture blocks only; in-block updates
-// from the timed run are discarded. A single-block invocation therefore
-// starts from an empty prior unless earlier blocks were supplied in the
-// fixture set. PriorReset uses an empty prior for every run.
+// a timed run of block N is a clone of the posterior carried from blocks
+// strictly below N. That posterior is the previous carry after Decay, plus
+// the conflict and safe observations of one timed RegionFence run of block
+// N-1 (the highest C in this process, one run, not multiplied by K). An
+// untimed C=1 pass is not used: it only observes safe reads. A single-block
+// invocation starts from an empty prior. PriorReset uses an empty prior for
+// every run. In-block updates stay inside the run's clone.
 func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rfstate.Pool, prior string, out io.Writer) error {
 	if runs < 1 {
 		runs = 1
@@ -73,6 +75,8 @@ func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rf
 		if err := CheckFixture(env, oracle); err != nil {
 			return fmt.Errorf("fixture block %d: %w", env.Number, err)
 		}
+		var learned *rfstate.Learner
+		learnedC := -1
 		for run := 0; run < runs; run++ {
 			for _, eng := range engines {
 				workers := cs
@@ -80,9 +84,13 @@ func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rf
 					workers = []int{1}
 				}
 				for _, c := range workers {
-					row, err := timedRun(env, eng, pool, c, base, oracle)
+					row, runLearner, err := timedRun(env, eng, pool, c, base, oracle)
 					if err != nil {
 						return fmt.Errorf("block %d engine %s C %d run %d: %w", env.Number, eng, c, run, err)
+					}
+					if eng == EngineRF && c >= learnedC && runLearner != nil {
+						learned = runLearner
+						learnedC = c
 					}
 					rec := []string{
 						strconv.FormatUint(env.Number, 10),
@@ -108,12 +116,12 @@ func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rf
 				}
 			}
 		}
-		if prior == PriorCarry {
-			learned := base.Clone()
-			if _, err := execParallel(env, rfstate.ModeRF, pool, 1, learned); err != nil {
-				return fmt.Errorf("learn block %d: %w", env.Number, err)
-			}
-			carried.Absorb(learned)
+		if prior == PriorCarry && learned != nil {
+			// Fade the history first, then add this block's observations at
+			// full weight. The timed run cloned base before the fade, so the
+			// delta is only what that run observed.
+			carried.Decay()
+			carried.ApplyDelta(base, learned)
 		}
 	}
 	w.Flush()
@@ -123,7 +131,7 @@ func RunBench(blocks []*BlockEnv, engines []string, cs []int, runs int, pool *rf
 	return nil
 }
 
-func timedRun(env *BlockEnv, eng string, pool *rfstate.Pool, c int, base *rfstate.Learner, oracle *Outcome) (*Outcome, error) {
+func timedRun(env *BlockEnv, eng string, pool *rfstate.Pool, c int, base *rfstate.Learner, oracle *Outcome) (*Outcome, *rfstate.Learner, error) {
 	var before, after debug.GCStats
 	debug.ReadGCStats(&before)
 	var learner *rfstate.Learner
@@ -133,17 +141,17 @@ func timedRun(env *BlockEnv, eng string, pool *rfstate.Pool, c int, base *rfstat
 	out, err := ExecEngine(env, eng, pool, c, learner)
 	debug.ReadGCStats(&after)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out.Counters.GCPauseNs = after.PauseTotal.Nanoseconds() - before.PauseTotal.Nanoseconds()
 	if eng == EngineSerial {
 		if err := CheckFixture(env, out); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return out, nil
+		return out, nil, nil
 	}
 	if err := CheckAgainstSerial(oracle, out, env.World); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	return out, learner, nil
 }

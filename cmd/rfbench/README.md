@@ -54,6 +54,7 @@ setup, not an engine warm-up. Engine state is still fresh on every timed run.
 
 ```sh
 # this VM (4 cores). Pass both fixture trees; they are sorted by block number.
+# With GOMAXPROCS unset, the process sets it to the largest -c (here 8).
 GOGC=100 ./rfbench \
   -fixtures /path/to/fixa,/path/to/fixb \
   -engines serial,occ,rf \
@@ -65,35 +66,50 @@ GOGC=100 ./rfbench \
   -out results.csv
 ```
 
-256-core host, pinned to CPUs 128-255. `GOMAXPROCS` is set by the process to
-the larger of the worker count, the CPU list, and `runtime.NumCPU` when the
-CPU list is empty.
+256-core host, pinned to CPUs 128-255. Run **one process per engine and
+C**, with `GOMAXPROCS=C`. The CPU list is only the pin mask: it does not
+raise `GOMAXPROCS` or the number of worker threads. If `GOMAXPROCS` is unset,
+the process sets it to the largest `-c` value.
 
 ```sh
 cpus=$(seq -s, 128 255)
-GOGC=100 GOMAXPROCS=128 ./rfbench \
-  -fixtures /path/to/fixa,/path/to/fixb \
-  -engines serial,occ,rf \
-  -c 1,2,4,8,16,32,64,128 \
-  -k 3 \
-  -cpus "$cpus" \
-  -prior carry \
-  -gogc 100 \
-  -out results.csv
+for eng in serial occ rf; do
+  for c in 1 2 4 8 16 32 64 128; do
+    if [ "$eng" = serial ] && [ "$c" != 1 ]; then
+      continue
+    fi
+    GOMAXPROCS=$c GOGC=100 ./rfbench \
+      -fixtures /path/to/fixa,/path/to/fixb \
+      -engines "$eng" \
+      -c "$c" \
+      -k 10 \
+      -cpus "$cpus" \
+      -prior carry \
+      -gogc 100 \
+      -out "results-${eng}-c${c}.csv"
+  done
+done
 ```
 
 There is no warm-up. Each timed run uses a fresh state and ledger.
 
 ### Prior
 
-Blocks are sorted by number.
+Blocks are sorted by number. Priors for block N come only from blocks below N.
 
 - `reset`: every timed run starts from an empty per-key Beta prior.
-- `carry`: the prior for block N is produced by one untimed RegionFence pass
-  over the fixture blocks strictly below N, then cloned for each of the K
-  timed runs. In-block updates during a timed run are discarded, so run K
-  does not see run K-1. A single-block command has no earlier block, so the
-  prior is empty even in `carry` mode.
+- `carry`: each timed RegionFence run clones the pre-block posterior, so
+  in-block updates do not leak into sibling runs or into that block's own
+  prior. After the block's timed runs, the carried posterior is decayed and
+  then updated with the observations of one timed run (the highest C in this
+  process; K runs are not summed). Decay multiplies the excess over the
+  Beta(1, 32) prior by 33/34, so the prior is the stationary point: a run of
+  safe observations cannot push a key's mean to zero without bound, and a
+  key that stops conflicting falls back toward the prior. Conflict counts
+  are not decayed, so a key stays fenced after its first invalidation.
+  An untimed C=1 pass is not used. That pass only records safe reads and
+  used to drift every key to PASS. A single-block command has no earlier
+  block, so the prior is empty even in `carry` mode.
 
 The P0 rule is greedy: a key is fenced after its first invalidation, and
 `WAIT_FINAL` is chosen when a lower producer exists and the posterior mean
@@ -145,7 +161,8 @@ nonce or estimate miss parks on the lower transaction.
 - Rollback restarts the transaction and fast-forwards by read sequence.
   Fast-forward skips waits; it still re-registers readers. Interpreter
   frames are not restored from the snapshot.
-- No empirical-Bayes decay. Priors are carried without forgetting.
+- Decay is a fixed prior-weight fade (33/34 per block), not a fitted
+  empirical-Bayes model. Conflict counts are not decayed.
 - Replay cost and wait cost are both 1.
 - OCC parks on a nonce producer instead of retrying immediately, so it is
   not a byte-for-byte Block-STM loop. The change is there to avoid the

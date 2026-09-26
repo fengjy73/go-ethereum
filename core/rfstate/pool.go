@@ -52,8 +52,9 @@ type runner struct {
 	Done func() bool
 }
 
-// NewPool starts max(len(cpus), 1) persistent workers. An empty CPU list pins
-// workers to CPU 0..n-1 of the machine, capped by GOMAXPROCS when n is 0.
+// NewPool starts maxC persistent workers. cpus is the pin placement set;
+// worker i is pinned to cpus[i%len(cpus)]. An empty list pins workers to
+// CPU 0..maxC-1. Idle workers block on the pool condition.
 func NewPool(cpus []int, maxC int) *Pool {
 	if maxC < 1 {
 		maxC = 1
@@ -70,11 +71,12 @@ func NewPool(cpus []int, maxC int) *Pool {
 			cpus = append(cpus, i)
 		}
 	}
-	// One worker per CPU, and extra workers if C can exceed the CPU list.
-	// Extra workers share CPUs round-robin; C is the active subset.
+	// One goroutine per active slot. C is the upper bound the caller will
+	// Drive; extra CPUs in the pin list are a placement set, not extra threads.
+	// Idle workers block on the pool cond, they do not poll.
 	n := maxC
-	if n < len(cpus) {
-		n = len(cpus)
+	if n < 1 {
+		n = 1
 	}
 	p := &Pool{cpus: append([]int(nil), cpus...), pinned: make([]string, n)}
 	p.cv = sync.NewCond(&p.mu)
@@ -88,6 +90,13 @@ func NewPool(cpus []int, maxC int) *Pool {
 
 // CPUs returns the configured affinity list.
 func (p *Pool) CPUs() []int { return append([]int(nil), p.cpus...) }
+
+// Width is the number of persistent worker goroutines.
+func (p *Pool) Width() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.pinned)
+}
 
 // PinReport returns per-worker affinity errors (empty string on success).
 func (p *Pool) PinReport() []string {

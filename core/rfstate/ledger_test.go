@@ -167,3 +167,43 @@ func TestLearnerGreedy(t *testing.T) {
 		t.Fatal("clone must not mutate the source")
 	}
 }
+
+func TestLearnerDecayAndDelta(t *testing.T) {
+	base := NewLearner()
+	k := SlotKeyOf(common.Address{2}, common.Hash{2})
+	for i := 0; i < 40; i++ {
+		base.ObserveConflict(k)
+	}
+	before := base.Clone()
+	run := before.Clone()
+	run.ObserveConflict(k)
+	run.ObserveSafe(k)
+
+	carried := before.Clone()
+	carried.Decay()
+	carried.ApplyDelta(before, run)
+
+	carried.mu.Lock()
+	got := carried.post[k]
+	carried.mu.Unlock()
+	before.mu.Lock()
+	prev := before.post[k]
+	before.mu.Unlock()
+
+	w := priorAlpha + priorBeta
+	fade := w / (w + 1)
+	wantA := priorAlpha + (prev.Alpha-priorAlpha)*fade + 1
+	wantB := priorBeta + (prev.Beta-priorBeta)*fade + 1
+	if got.Alpha != wantA || got.Beta != wantB {
+		t.Fatalf("posterior alpha=%v beta=%v, want %v %v", got.Alpha, got.Beta, wantA, wantB)
+	}
+	if got.Conflicts != prev.Conflicts+1 {
+		t.Fatalf("conflicts %d, want %d", got.Conflicts, prev.Conflicts+1)
+	}
+	// A second apply of the same single-run delta must not be how K runs
+	// accumulate: the caller passes one run. Repeating it here would double
+	// the observation, which is the behavior the bench must avoid.
+	if got.Conflicts == prev.Conflicts {
+		t.Fatal("delta dropped the conflict")
+	}
+}

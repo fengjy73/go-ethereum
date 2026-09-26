@@ -17,6 +17,7 @@
 package rfstate
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -69,6 +70,7 @@ type TxView struct {
 	journal  []func()
 	snaps    []rev
 	nextSnap int
+	free     []*localAcct
 
 	access    *accList
 	transient map[tkey]common.Hash
@@ -103,25 +105,78 @@ type localAcct struct {
 	storageDirty map[common.Hash]struct{}
 }
 
-// NewTxView builds a view. abort may be nil. deps may be nil (never waits).
-func NewTxView(mode Mode, tx int, attempt uint64, ffUntil int, store *Store, ledger *Ledger, learner *Learner, deps Deps, abort *atomic.Bool, coinbase common.Address) *TxView {
+var viewPool = sync.Pool{New: func() any {
 	return &TxView{
-		mode:      mode,
-		tx:        tx,
-		attempt:   attempt,
-		ffUntil:   ffUntil,
-		store:     store,
-		ledger:    ledger,
-		learner:   learner,
-		deps:      deps,
-		abort:     abort,
-		coinbase:  coinbase,
 		accs:      map[common.Address]*localAcct{},
 		fetched:   map[Key]bool{},
 		access:    newAccList(),
 		transient: map[tkey]common.Hash{},
 		ownFee:    uint256.NewInt(0),
 	}
+}}
+
+// NewTxView builds a view. abort may be nil. deps may be nil (never waits).
+// Release returns the view to a pool; forgetting Release only skips reuse.
+func NewTxView(mode Mode, tx int, attempt uint64, ffUntil int, store *Store, ledger *Ledger, learner *Learner, deps Deps, abort *atomic.Bool, coinbase common.Address) *TxView {
+	v := viewPool.Get().(*TxView)
+	v.recycle()
+	v.mode = mode
+	v.tx = tx
+	v.attempt = attempt
+	v.ffUntil = ffUntil
+	v.store = store
+	v.ledger = ledger
+	v.learner = learner
+	v.deps = deps
+	v.abort = abort
+	v.coinbase = coinbase
+	if v.ownFee == nil {
+		v.ownFee = uint256.NewInt(0)
+	} else {
+		v.ownFee.Clear()
+	}
+	return v
+}
+
+// Release returns the view to the pool. Log objects already handed to the
+// scheduler stay valid; the view only drops its references.
+func (v *TxView) Release() {
+	if v == nil {
+		return
+	}
+	v.store = nil
+	v.ledger = nil
+	v.learner = nil
+	v.deps = nil
+	v.abort = nil
+	viewPool.Put(v)
+}
+
+func (v *TxView) recycle() {
+	for addr, a := range v.accs {
+		a.recycle()
+		v.free = append(v.free, a)
+		delete(v.accs, addr)
+	}
+	clear(v.fetched)
+	v.pass = v.pass[:0]
+	v.wrote = v.wrote[:0]
+	v.occ = v.occ[:0]
+	v.journal = v.journal[:0]
+	v.snaps = v.snaps[:0]
+	v.logs = v.logs[:0]
+	v.readSeq = 0
+	v.regions = 0
+	v.nextSnap = 0
+	v.refund = 0
+	v.feeSum = nil
+	v.coinObs = nil
+	v.thash = common.Hash{}
+	if v.access != nil {
+		v.access.reset()
+	}
+	clear(v.transient)
+	clear(v.preimages)
 }
 
 // Regions is the number of fenced cuts taken in this attempt.
@@ -158,16 +213,47 @@ func (v *TxView) undo(fn func()) { v.journal = append(v.journal, fn) }
 
 func (v *TxView) acct(addr common.Address) *localAcct {
 	a := v.accs[addr]
-	if a == nil {
-		a = &localAcct{
-			bal:          uint256.NewInt(0),
-			storage:      map[common.Hash]common.Hash{},
-			storageOrig:  map[common.Hash]common.Hash{},
-			storageDirty: map[common.Hash]struct{}{},
-		}
-		v.accs[addr] = a
+	if a != nil {
+		return a
 	}
+	n := len(v.free)
+	if n > 0 {
+		a = v.free[n-1]
+		v.free = v.free[:n-1]
+	} else {
+		a = &localAcct{}
+	}
+	if a.bal == nil {
+		a.bal = uint256.NewInt(0)
+	}
+	v.accs[addr] = a
 	return a
+}
+
+func (a *localAcct) recycle() {
+	st, so, sd := a.storage, a.storageOrig, a.storageDirty
+	*a = localAcct{}
+	if st != nil {
+		clear(st)
+		a.storage = st
+	}
+	if so != nil {
+		clear(so)
+		a.storageOrig = so
+	}
+	if sd != nil {
+		clear(sd)
+		a.storageDirty = sd
+	}
+}
+
+func (a *localAcct) slots() {
+	if a.storage != nil {
+		return
+	}
+	a.storage = map[common.Hash]common.Hash{}
+	a.storageOrig = map[common.Hash]common.Hash{}
+	a.storageDirty = map[common.Hash]struct{}{}
 }
 
 func (v *TxView) isCoinbaseBal(k Key) bool {
@@ -215,13 +301,18 @@ func (v *TxView) fence(k Key, seq int) {
 		}
 		return
 	}
-	if v.learner != nil && v.learner.Fenced(k) {
-		v.regions++
-		v.Snapshot()
-	}
+	// A key with no conflict evidence has posterior mean 1/33, so the greedy
+	// rule is PASS whether or not a lower producer exists. Skip the second
+	// key lock and the learner map.
 	if v.learner == nil || v.ledger == nil {
 		return
 	}
+	if !v.learner.Fenced(k) {
+		v.pass = append(v.pass, k)
+		return
+	}
+	v.regions++
+	v.Snapshot()
 	prod, ok := v.ledger.LowerProducer(v.tx, k)
 	if !ok || v.learner.Choose(k, true) != FenceWaitFinal {
 		v.pass = append(v.pass, k)
@@ -258,7 +349,12 @@ func (v *TxView) loadBal(addr common.Address, a *localAcct) {
 	if res.FromVersion {
 		a.bal = decBalance(res.Data)
 	} else if base, ok := v.store.Account(addr); ok && base.Exists {
-		a.bal = base.Balance
+		// Own the balance. GetBalance hands this pointer to the EVM, matching
+		// StateDB, and must not alias the store.
+		a.bal = new(uint256.Int)
+		if base.Balance != nil {
+			a.bal.Set(base.Balance)
+		}
 		if !a.existKnown {
 			a.exists = true
 			a.existKnown = true
@@ -324,7 +420,12 @@ func (v *TxView) loadCode(addr common.Address, a *localAcct) {
 	}
 	res := v.readMV(CodeKey(addr), true)
 	if res.FromVersion {
-		a.code = append([]byte(nil), res.Data...)
+		// Ledger version bytes are immutable. The hash was cached at publish.
+		a.code = res.Data
+		a.codeHash = res.CodeHash
+		if a.codeHash == (common.Hash{}) {
+			a.codeHash = CodeHash(true, a.code)
+		}
 		// Existence comes only from ExistKey or the store. A deleted account
 		// publishes empty code; that version must not resurrect it.
 		if !a.existKnown && len(a.code) > 0 {
@@ -332,13 +433,19 @@ func (v *TxView) loadCode(addr common.Address, a *localAcct) {
 			a.existKnown = true
 		}
 	} else if base, ok := v.store.Account(addr); ok && base.Exists {
-		a.code = append([]byte(nil), base.Code...)
+		a.code = base.Code
+		a.codeHash = base.CodeHash
+		if a.codeHash == (common.Hash{}) {
+			a.codeHash = CodeHash(true, a.code)
+		}
 		if !a.existKnown {
 			a.exists = true
 			a.existKnown = true
 		}
 	}
-	a.codeHash = CodeHash(a.exists, a.code)
+	if a.codeHash == (common.Hash{}) {
+		a.codeHash = CodeHash(a.exists, a.code)
+	}
 	a.codeKnown = true
 }
 
@@ -491,7 +598,7 @@ func (v *TxView) accountEmptyLoaded(addr common.Address, a *localAcct) bool {
 func (v *TxView) GetBalance(addr common.Address) *uint256.Int {
 	a := v.acct(addr)
 	v.loadBal(addr, a)
-	return new(uint256.Int).Set(a.bal)
+	return a.bal
 }
 
 func (v *TxView) GetNonce(addr common.Address) uint64 {
@@ -539,22 +646,18 @@ func (v *TxView) GetCode(addr common.Address) []byte {
 		return nil
 	}
 	v.loadCode(addr, a)
-	if len(a.code) == 0 {
-		return nil
-	}
-	return append([]byte(nil), a.code...)
+	return a.code
 }
 
 func (v *TxView) SetCode(addr common.Address, code []byte, reason tracing.CodeChangeReason) []byte {
 	v.guard()
 	a := v.ensureWrite(addr)
 	v.loadCode(addr, a)
-	prev := append([]byte(nil), a.code...)
+	prev := a.code
 	cp := append([]byte(nil), code...)
 	oldHash, oldDirty := a.codeHash, a.codeDirty
-	oldCode := append([]byte(nil), a.code...)
 	v.undo(func() {
-		a.code = oldCode
+		a.code = prev
 		a.codeHash = oldHash
 		a.codeDirty = oldDirty
 	})
@@ -608,6 +711,7 @@ func (v *TxView) GetStateAndCommittedState(addr common.Address, hash common.Hash
 func (v *TxView) GetState(addr common.Address, hash common.Hash) common.Hash {
 	v.guard()
 	a := v.acct(addr)
+	a.slots()
 	if val, ok := a.storage[hash]; ok {
 		return val
 	}
@@ -759,8 +863,16 @@ func (v *TxView) AddSlotToAccessList(addr common.Address, slot common.Hash) {
 
 func (v *TxView) Prepare(rules params.Rules, sender, coinbase common.Address, dest *common.Address, precompiles []common.Address, list types.AccessList) {
 	v.rules = rules
-	v.access = newAccList()
-	v.transient = map[tkey]common.Hash{}
+	if v.access == nil {
+		v.access = newAccList()
+	} else {
+		v.access.reset()
+	}
+	if v.transient == nil {
+		v.transient = map[tkey]common.Hash{}
+	} else {
+		clear(v.transient)
+	}
 	if rules.IsEIP2929 {
 		v.access.addAddr(sender)
 		if dest != nil {
@@ -865,8 +977,8 @@ func (v *TxView) Finalise(rules params.Rules) *bal.ConstructionBlockAccessList {
 	if v.mode == ModeDirect {
 		v.flushDirect()
 	}
-	v.journal = nil
-	v.snaps = nil
+	v.journal = v.journal[:0]
+	v.snaps = v.snaps[:0]
 	v.refund = 0
 	return nil
 }
@@ -900,7 +1012,8 @@ func (v *TxView) Publish() {
 			v.pub(NonceKey(addr), encU64(a.nonce))
 		}
 		if a.codeDirty {
-			v.pub(CodeKey(addr), append([]byte(nil), a.code...))
+			// Publish copies once. Code bytes are not mutated after this.
+			v.pub(CodeKey(addr), a.code)
 		}
 		for slot := range a.storageDirty {
 			v.pub(SlotKeyOf(addr, slot), encHash(a.storage[slot]))
@@ -944,7 +1057,8 @@ func (v *TxView) baseBytes(k Key) []byte {
 		return encU64(0)
 	case KindCode:
 		if a, ok := v.store.Account(k.Addr); ok {
-			return append([]byte(nil), a.Code...)
+			// Store code is immutable. Equality checks must not copy it.
+			return a.Code
 		}
 		return nil
 	case KindExist:
@@ -996,7 +1110,7 @@ func (v *TxView) flushDirect() {
 			v.store.PutSlot(addr, slot, a.storage[slot])
 		}
 		a.balDirty, a.nonceDirty, a.codeDirty = false, false, false
-		a.storageDirty = map[common.Hash]struct{}{}
+		clear(a.storageDirty)
 	}
 }
 
@@ -1046,6 +1160,10 @@ func (a *accList) addSlot(addr common.Address, slot common.Hash) (addrNew bool, 
 		slotNew = true
 	}
 	return addrNew, slotNew
+}
+
+func (a *accList) reset() {
+	clear(a.addrs)
 }
 
 func (a *accList) delAddr(addr common.Address) { delete(a.addrs, addr) }

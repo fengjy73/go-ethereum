@@ -65,14 +65,12 @@ func main() {
 			maxC = c
 		}
 	}
-	if len(cpus) > maxC {
-		maxC = len(cpus)
+	// The pin list is a placement set. It must not inflate GOMAXPROCS or the
+	// worker count: a 128-CPU mask with -c 4 used to start 128 threads.
+	// An explicit GOMAXPROCS (one process per C in the scan) is left as set.
+	if _, ok := os.LookupEnv("GOMAXPROCS"); !ok {
+		runtime.GOMAXPROCS(maxC)
 	}
-	procs := maxC
-	if n := runtime.NumCPU(); procs < n && len(cpus) == 0 {
-		procs = n
-	}
-	runtime.GOMAXPROCS(procs)
 	blocks, err := rfexec.LoadFixtures(dirs...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

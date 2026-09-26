@@ -279,12 +279,14 @@ func parsePrestate(raw []byte) (*rfstate.World, error) {
 				// retain an empty account that serial finalisation deletes.
 				if bal.Sign() != 0 || nonce != 0 || len(code) > 0 {
 					preexisted[addr] = true
-					w.Accounts[addr] = &rfstate.Account{
+					acc := &rfstate.Account{
 						Exists:  true,
 						Balance: bal,
 						Nonce:   nonce,
 						Code:    code,
 					}
+					acc.Seal()
+					w.Accounts[addr] = acc
 				}
 			}
 			if !preexisted[addr] {

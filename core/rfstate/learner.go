@@ -16,7 +16,10 @@
 
 package rfstate
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // Cold-start global prior. Mean conflict probability is 1/33. Keys with no
 // observations use this prior; nothing is injected from a global hot set.
@@ -56,8 +59,9 @@ type Posterior struct {
 // one half and a lower producer is already known". Costs stay equal in P0
 // (Thompson sampling and measured costs are P1).
 type Learner struct {
-	mu   sync.Mutex
-	post map[Key]Posterior
+	mu        sync.Mutex
+	post      map[Key]Posterior
+	anyFenced atomic.Uint32 // 1 once any key has Conflicts > 0
 }
 
 // NewLearner returns an empty learner (every key uses the global prior).
@@ -77,6 +81,7 @@ func (l *Learner) Clone() *Learner {
 	for k, v := range l.post {
 		n.post[k] = v
 	}
+	n.anyFenced.Store(l.anyFenced.Load())
 	return n
 }
 
@@ -99,7 +104,7 @@ func (l *Learner) get(k Key) Posterior {
 
 // Fenced reports whether the key has conflict evidence and should open a region.
 func (l *Learner) Fenced(k Key) bool {
-	if l == nil {
+	if l == nil || l.anyFenced.Load() == 0 {
 		return false
 	}
 	l.mu.Lock()
@@ -136,6 +141,7 @@ func (l *Learner) ObserveConflict(k Key) {
 	p.Alpha++
 	p.Conflicts++
 	l.post[k] = p
+	l.anyFenced.Store(1)
 }
 
 // ObserveSafe records one PASS read that was still valid when the reader finalized.
@@ -148,6 +154,76 @@ func (l *Learner) ObserveSafe(k Key) {
 	p := l.get(k)
 	p.Beta++
 	l.post[k] = p
+}
+
+// Decay fades excess counts by w/(w+1), where w is the prior's own weight
+// (priorAlpha+priorBeta). The prior is the stationary point, so a run of
+// safe observations cannot drive every key to PASS, and a key that stops
+// conflicting falls back toward the prior. One block adds its observations
+// after this fade, at full weight.
+func (l *Learner) Decay() {
+	if l == nil {
+		return
+	}
+	w := priorAlpha + priorBeta
+	fade := w / (w + 1)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for k, p := range l.post {
+		p.Alpha = priorAlpha + (p.Alpha-priorAlpha)*fade
+		p.Beta = priorBeta + (p.Beta-priorBeta)*fade
+		l.post[k] = p
+	}
+}
+
+// ApplyDelta adds the observations that turned before into after.
+// before is the prior the timed run cloned; after is that run's learner.
+func (l *Learner) ApplyDelta(before, after *Learner) {
+	if l == nil || after == nil {
+		return
+	}
+	after.mu.Lock()
+	type delta struct {
+		k     Key
+		dA    float64
+		dB    float64
+		dConf uint64
+	}
+	var rows []delta
+	for k, got := range after.post {
+		base := Posterior{Alpha: priorAlpha, Beta: priorBeta}
+		if before != nil {
+			before.mu.Lock()
+			if p, ok := before.post[k]; ok {
+				base = p
+			}
+			before.mu.Unlock()
+		}
+		dA := got.Alpha - base.Alpha
+		dB := got.Beta - base.Beta
+		var dConf uint64
+		if got.Conflicts > base.Conflicts {
+			dConf = got.Conflicts - base.Conflicts
+		}
+		if dA == 0 && dB == 0 && dConf == 0 {
+			continue
+		}
+		rows = append(rows, delta{k, dA, dB, dConf})
+	}
+	after.mu.Unlock()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, row := range rows {
+		p := l.get(row.k)
+		p.Alpha += row.dA
+		p.Beta += row.dB
+		p.Conflicts += row.dConf
+		l.post[row.k] = p
+		if p.Conflicts > 0 {
+			l.anyFenced.Store(1)
+		}
+	}
 }
 
 // Absorb copies every posterior from src (used when a learning pass finishes).
@@ -164,4 +240,5 @@ func (l *Learner) Absorb(src *Learner) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.post = cp
+	l.anyFenced.Store(src.anyFenced.Load())
 }

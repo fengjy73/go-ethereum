@@ -29,6 +29,18 @@
 5. **已完成** 单测、五块夹具 C=1,2,4,8、`go test -race`、`rfbench` CSV。golangci-lint 对新包 0 issues，`check_baddeps` 通过。
 6. **已完成** 提交 `0ff2f1509` 已推送。草稿 PR：https://github.com/fengjy73/go-ethereum/pull/1
 
+## Stage 1b
+
+目标：砍掉单线程开销和多核争用，仍走同一分支 / PR #1。串行路径与十块正确性矩阵（C=1/2/4/8，含 race）保持通过。
+
+1. **已完成** 读写集限定 DropEstimates / RemoveReaders / Retract / MarkEstimate。键索引按 GOMAXPROCS 分片。
+2. **已完成** 代码哈希随账户和代码版本携带，代码字节共享，不在加载时重算 keccak。
+3. **已完成** 每个 worker 复用一个 EVM；块内共享 `core.NewJumpDestCache`。
+4. **已完成** TxView 池化；系统调用视图用完归还。余额在加载时拷一次，`GetBalance` 返回该指针。
+5. **已完成** 空闲 worker 在条件变量上等待。池大小等于最大 C。已设置的 `GOMAXPROCS` 不被覆盖。
+6. **已完成** carry 来自计时并行跑的冲突，并按 33/34 衰减。未围栏的键不再为了 `LowerProducer` 再锁一次键。
+7. **已完成** 十块正确性与 `go test -race` 通过（rfexec 约 78s）。本机 `GOMAXPROCS=C`、K=3 中位数：C=1 相对串行几何平均约 1.49x（目标 1.3x，未达到）；十个块的 rf(C=4) 中位数都快于 rf(C=1)。分配从约 150–520 MiB/块降到约 13–25 MiB。
+
 ## 验证记录
 
 - `go test ./core/rfstate` 通过，含 `TestDropEstimatesRemovesUnpublishedKey`。

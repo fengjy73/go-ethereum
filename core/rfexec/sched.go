@@ -93,10 +93,13 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 	warmCrypto()
 	t0 := time.Now()
 	pre := directView(store, env.Header.Coinbase)
-	if err := runPre(env, newEVM(env, pre)); err != nil {
-		return nil, err
+	errPre := runPre(env, newEVM(env, pre))
+	pre.Release()
+	if errPre != nil {
+		return nil, errPre
 	}
 	s := newSched(env, mode, store, learner)
+	s.bindWorkers(pool.Width())
 	pool.Drive(workers, s.Step, s.Done)
 	err := s.wait()
 	pool.Release()
@@ -111,10 +114,14 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		logs = append(logs, r.Logs...)
 	}
 	post := directView(store, env.Header.Coinbase)
-	if err := runPost(env, newEVM(env, post), logs); err != nil {
-		return nil, err
+	errPost := runPost(env, newEVM(env, post), logs)
+	post.Release()
+	if errPost != nil {
+		return nil, errPost
 	}
-	runWithdrawals(env, directView(store, env.Header.Coinbase))
+	withdrawals := directView(store, env.Header.Coinbase)
+	runWithdrawals(env, withdrawals)
+	withdrawals.Release()
 	wall := time.Since(t0)
 	root := types.DeriveSha(types.Receipts(receipts), newStackTrie())
 	var gas uint64
@@ -171,6 +178,8 @@ type sched struct {
 	inflight int
 	fatal    error
 	ctr      Counters
+	evms     []*vm.EVM
+	jumps    vm.JumpDestCache
 }
 
 func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *rfstate.Learner) *sched {
@@ -183,7 +192,17 @@ func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *r
 	}
 	s.cv = sync.NewCond(&s.mu)
 	s.ledger = rfstate.NewLedger(len(env.Txs), learner, s.onVictim)
+	s.jumps = core.NewJumpDestCache()
 	return s
+}
+
+// bindWorkers sizes the per-worker EVM cache. Each worker reuses one EVM and
+// the block-shared jumpdest cache for the whole block.
+func (s *sched) bindWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	s.evms = make([]*vm.EVM, n)
 }
 
 func (s *sched) PrefixFinal(tx int) bool {
@@ -251,7 +270,7 @@ func (s *sched) Step(worker int) {
 		s.inflight++
 		s.ctr.Executions++
 		s.mu.Unlock()
-		s.execute(idx, attempt, ff)
+		s.execute(worker, idx, attempt, ff)
 		s.mu.Lock()
 	}
 }
@@ -279,7 +298,7 @@ func (s *sched) pickLocked() int {
 	return -1
 }
 
-func (s *sched) execute(idx int, attempt uint64, ff int) {
+func (s *sched) execute(worker, idx int, attempt uint64, ff int) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			sig, ok := rec.(rfstate.Signal)
@@ -287,6 +306,9 @@ func (s *sched) execute(idx int, attempt uint64, ff int) {
 				s.mu.Lock()
 				s.fatal = fmt.Errorf("block %d tx %d panic: %v", s.env.Number, idx, rec)
 				s.inflight--
+				if s.txs[idx].attempt == attempt {
+					s.txs[idx].evm = nil
+				}
 				s.cv.Broadcast()
 				s.mu.Unlock()
 				return
@@ -296,7 +318,10 @@ func (s *sched) execute(idx int, attempt uint64, ff int) {
 	}()
 	s.prepare(idx)
 	view := rfstate.NewTxView(s.mode, idx, attempt, ff, s.store, s.ledger, s.learner, s, &s.txs[idx].abort, s.env.Header.Coinbase)
-	evm := newEVM(s.env, view)
+	defer view.Release()
+	tx := s.env.Txs[idx]
+	view.SetTxContext(tx.Hash(), idx, uint32(idx+1))
+	evm := s.workerEVM(worker, view, core.NewEVMTxContext(s.env.Msgs[idx]))
 	s.mu.Lock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
 		s.inflight--
@@ -306,10 +331,6 @@ func (s *sched) execute(idx int, attempt uint64, ff int) {
 	}
 	s.txs[idx].evm = evm
 	s.mu.Unlock()
-
-	tx := s.env.Txs[idx]
-	view.SetTxContext(tx.Hash(), idx, uint32(idx+1))
-	evm.SetTxContext(core.NewEVMTxContext(s.env.Msgs[idx]))
 	gp := core.NewGasPool(s.env.Header.GasLimit)
 	result, err := core.ApplyMessage(evm, s.env.Msgs[idx], gp)
 	if s.superseded(idx, attempt) {
@@ -354,9 +375,29 @@ func (s *sched) superseded(idx int, attempt uint64) bool {
 	if s.txs[idx].attempt == attempt && s.txs[idx].status == stRunning {
 		return false
 	}
+	if s.txs[idx].attempt == attempt {
+		s.txs[idx].evm = nil
+	}
 	s.inflight--
 	s.cv.Broadcast()
 	return true
+}
+
+func (s *sched) workerEVM(worker int, db vm.StateDB, txCtx vm.TxContext) *vm.EVM {
+	if worker < 0 || worker >= len(s.evms) {
+		evm := newEVM(s.env, db)
+		evm.SetJumpDestCache(s.jumps)
+		evm.PrepareTx(db, txCtx)
+		return evm
+	}
+	evm := s.evms[worker]
+	if evm == nil {
+		evm = newEVM(s.env, db)
+		evm.SetJumpDestCache(s.jumps)
+		s.evms[worker] = evm
+	}
+	evm.PrepareTx(db, txCtx)
+	return evm
 }
 
 func (s *sched) aborted(idx int, attempt uint64, evm *vm.EVM) bool {

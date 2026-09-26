@@ -52,6 +52,30 @@ func SlotKeyOf(addr common.Address, slot common.Hash) Key {
 	return Key{Kind: KindSlot, Addr: addr, Slot: slot}
 }
 
+// stripe maps a key onto [0, mask]. mask must be one less than a power of two.
+// The mix is FNV-1a over the kind, address, and the ends of the slot so two
+// slots of one account do not share a stripe.
+func (k Key) stripe(mask uint32) uint32 {
+	h := uint32(2166136261)
+	h ^= uint32(k.Kind)
+	h *= 16777619
+	h ^= binary.LittleEndian.Uint32(k.Addr[0:4])
+	h *= 16777619
+	h ^= binary.LittleEndian.Uint32(k.Addr[4:8])
+	h *= 16777619
+	h ^= binary.LittleEndian.Uint32(k.Addr[8:12])
+	h *= 16777619
+	h ^= binary.LittleEndian.Uint32(k.Addr[12:16])
+	h *= 16777619
+	h ^= binary.LittleEndian.Uint32(k.Addr[16:20])
+	h *= 16777619
+	h ^= binary.LittleEndian.Uint32(k.Slot[0:4])
+	h *= 16777619
+	h ^= binary.LittleEndian.Uint32(k.Slot[28:32])
+	h *= 16777619
+	return h & mask
+}
+
 func encU64(n uint64) []byte {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], n)
