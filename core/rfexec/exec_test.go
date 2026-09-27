@@ -24,10 +24,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rfstate"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -387,6 +390,54 @@ func assembleEarlyWait() []byte {
 	push1(2)
 	emit(0x54, 0x50, 0x00) // SLOAD POP STOP
 	return code
+}
+
+// TestFinishUnlockDoesNotRaceTouchMap forces the coinbase-validation
+// unlock inside tryAdvanceLocked and writes touch[idx] from another
+// goroutine for the whole window. finish used to iterate that map on
+// the way out (crew noteIO). Concurrent iteration and write is fatal
+// even without the race detector.
+func TestFinishUnlockDoesNotRaceTouchMap(t *testing.T) {
+	env := &BlockEnv{
+		Txs:      make([]*types.Transaction, 2),
+		PrevSame: []int{-1, -1},
+		Header:   &types.Header{Coinbase: common.Address{9}},
+	}
+	s := newSched(env, rfstate.ModeRF, nil, nil)
+	s.crew = newCrew(NewCostPrior(), 2, env)
+	s.inflight = 1
+	s.txs[0].status = stFinished
+	s.txs[0].preds = []rfstate.CoinPred{{Empty: true, Val: false}}
+	s.txs[1].status = stRunning
+	seed := rfstate.SlotKeyOf(common.Address{1}, common.Hash{1})
+	s.ledger.Read(1, 0, seed, true)
+
+	stop := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	s.testDuringUnlock = func() {
+		once.Do(func() {
+			go func() {
+				close(started)
+				k := rfstate.SlotKeyOf(common.Address{2}, common.Hash{2})
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+						s.ledger.Read(1, 3, k, true)
+					}
+				}
+			}()
+		})
+		<-started
+	}
+	defer close(stop)
+
+	var abort atomic.Bool
+	view := rfstate.NewTxView(rfstate.ModeRF, 1, 0, 0, nil, s.ledger, nil, nil, &abort, common.Address{})
+	defer view.Release()
+	s.finish(1, 0, view, &core.ExecutionResult{UsedGas: 21000})
 }
 
 func TestLoadFixtureShape(t *testing.T) {

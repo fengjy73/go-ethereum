@@ -225,12 +225,20 @@ lets one 1.4x sample adopt C=4, and keeps an untried C=32 rare. If the
 structural speedup cannot fill the arm, `(1+log2(C))/sqrt(speedup)`
 replaces the quadratic when it is higher, so a sender chain does not
 explore. `speedup` is work/CP from the structural model, capped by the
-process limit, and is only this prior feature. With no samples the draw
-is the prior mean and no noise, so the first block is C=1 rather than
-the cap. After that, each block draws once from
-Normal(posterior mean, variance of the mean) and takes the minimum.
-Clones of the same pre-block model share the seed, so the K runs of one
-block pick the same arm.
+process limit, and is only this prior feature. With no samples there is
+no draw. The first block uses the opening frontier (ready transactions
+not blocked on an earlier one from the same sender), capped by the number
+of distinct senders, or by PrevSame chain heads when senders were not
+recovered. Distinct contracts do not lower it: one router and many
+senders is still parallel. That probe is capped at 4. A cold model does
+not open at 1 on a wide block, and it does not open at the process cap.
+After that, each block draws once from Normal(posterior mean, variance
+of the mean) over arms that have a sample and the untried grid neighbors
+of those arms. A rung further out is not a candidate, so a model that
+has tried 4 cannot jump to 32. Every fourth draw replaces a sampled
+winner with one untried neighbor (the lower pessimistic mean), which is
+how 2 and then 8 get a single bounded try. Clones of the same pre-block
+model share the seed, so the K runs of one block pick the same arm.
 
 The arm set is that grid for the cap only. The opening frontier width is
 not an arm: a width of 25 on a cap of 32 used to add 25 to `{1,2,4,8,16,32}`.
@@ -238,12 +246,23 @@ The chosen arm is clamped down to the greatest grid rung that does not
 exceed the width, so a single-sender chain still runs at 1.
 
 In-block changes are guards only. The frontier width is an EWMA with
-alpha 0.25; the integer cap moves when the average is a full worker away,
-and if that cap falls below the active count the active count follows it
-down and does not climb back. An abort storm (at least eight completions
-and more rollbacks than completions) or sustained idle (idle time above
-elapsed*(active-1) after four completions) halves the active count, again
-without climbing back and without changing the arm.
+alpha 0.25; the integer cap moves when the average is a full worker away.
+The active count follows that cap down only after the smoothed width has
+stayed below it for 8ms, and not while a re-execution is still queued.
+It does not climb back. The last two transactions still drop to the
+frontier immediately; that tail is what drains a short block. An abort
+storm (at least eight completions and more rollbacks than completions)
+or sustained idle (idle time above elapsed*(active-1) after four
+completions) halves the active count, again without climbing back and
+without changing the arm.
+
+Idle workers block on the scheduler condition. A commit signals only as
+many waiters as there are newly ready tasks (the finishing worker takes
+one itself). The coordinator and the advance queue wait on their own
+conditions, so that signal is not stolen and is not a broadcast. Waking
+every idle worker at C=32 left the Go scheduler spinning processors that
+found no work. Shrinking the active count still wakes them once, so the
+extra workers leave the block.
 
 A block that is too small to pay for parallel startup runs at C=1 for
 the whole block and uses the solo path. Before a serial rate exists that
@@ -362,7 +381,8 @@ nonce or estimate miss parks on the lower transaction.
   The critical path is only a prior feature. There is no per-C inflation
   or fixed-cost regression on the decision path. Tail drain does not
   become the next block's prior. The first block of a process has no
-  measured rate, so its `model_pred_ns` is 0 and its arm is 1.
+  measured rate, so its `model_pred_ns` is 0. Its arm is the structural
+  cold cap above, not 1 and not the process cap.
 - Rollback restarts the transaction and fast-forwards by read sequence.
   Fast-forward skips waits; it still re-registers readers. Interpreter
   frames are not restored from the snapshot.

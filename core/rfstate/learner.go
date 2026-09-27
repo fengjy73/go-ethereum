@@ -91,6 +91,10 @@ type Learner struct {
 	post      map[Key]Posterior
 	cost      map[Key]keyCost
 	anyFenced atomic.Uint32 // 1 once any key has Conflicts > 0
+	// fenced is an immutable set swapped in when a key first conflicts.
+	// Fenced is on the read path of every key once anyFenced is set; it
+	// must not take mu. The published map is never written.
+	fenced atomic.Pointer[map[Key]struct{}]
 }
 
 // NewLearner returns an empty learner (every key uses the global prior).
@@ -117,6 +121,13 @@ func (l *Learner) Clone() *Learner {
 		n.cost[k] = v
 	}
 	n.anyFenced.Store(l.anyFenced.Load())
+	if p := l.fenced.Load(); p != nil {
+		cp := make(map[Key]struct{}, len(*p))
+		for k := range *p {
+			cp[k] = struct{}{}
+		}
+		n.fenced.Store(&cp)
+	}
 	return n
 }
 
@@ -142,10 +153,37 @@ func (l *Learner) Fenced(k Key) bool {
 	if l == nil || l.anyFenced.Load() == 0 {
 		return false
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	p, ok := l.post[k]
-	return ok && p.Conflicts > 0
+	p := l.fenced.Load()
+	if p == nil {
+		return false
+	}
+	_, ok := (*p)[k]
+	return ok
+}
+
+// noteFencedLocked publishes k into the lock-free set. The caller holds mu.
+// The map installed by a previous call is left unchanged.
+func (l *Learner) noteFencedLocked(k Key) {
+	if l == nil {
+		return
+	}
+	old := l.fenced.Load()
+	if old != nil {
+		if _, ok := (*old)[k]; ok {
+			l.anyFenced.Store(1)
+			return
+		}
+	}
+	next := make(map[Key]struct{}, 1)
+	if old != nil {
+		next = make(map[Key]struct{}, len(*old)+1)
+		for x := range *old {
+			next[x] = struct{}{}
+		}
+	}
+	next[k] = struct{}{}
+	l.fenced.Store(&next)
+	l.anyFenced.Store(1)
 }
 
 // Choose picks PASS or WAIT_FINAL. Coinbase and nonce are decided by the caller.
@@ -282,7 +320,7 @@ func (l *Learner) ObserveConflict(k Key) {
 	p.Alpha++
 	p.Conflicts++
 	l.post[k] = p
-	l.anyFenced.Store(1)
+	l.noteFencedLocked(k)
 }
 
 // EarlyWrite reports that this key is fenced and its writes are usually final
@@ -430,7 +468,7 @@ func (l *Learner) ApplyDelta(before, after *Learner) {
 		p.Multi += row.dMulti
 		l.post[row.k] = p
 		if p.Conflicts > 0 {
-			l.anyFenced.Store(1)
+			l.noteFencedLocked(row.k)
 		}
 	}
 	// Durations are not beta counts. The timed run cloned the prior, so its
@@ -459,5 +497,11 @@ func (l *Learner) Absorb(src *Learner) {
 	defer l.mu.Unlock()
 	l.post = cp
 	l.cost = cc
-	l.anyFenced.Store(src.anyFenced.Load())
+	l.fenced.Store(nil)
+	l.anyFenced.Store(0)
+	for k, p := range l.post {
+		if p.Conflicts > 0 {
+			l.noteFencedLocked(k)
+		}
+	}
 }

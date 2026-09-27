@@ -104,8 +104,8 @@ func strconvItoa(n int) string {
 
 func TestColdPriorDoesNotOpenAtCap(t *testing.T) {
 	c := newCrew(NewCostPrior(), 32, chainEnv(64, independentPrev(64), 100000))
-	if got := c.begin(32); got != 1 {
-		t.Fatalf("cold opening %d, want 1 (no Thompson noise on an empty model)", got)
+	if got := c.begin(32); got != 4 {
+		t.Fatalf("cold opening %d, want 4 (structural cap, not the process cap and not C=1)", got)
 	}
 	ref := c.cost.refRate()
 	for _, arm := range []int{2, 4, 8, 16, 32} {
@@ -116,8 +116,68 @@ func TestColdPriorDoesNotOpenAtCap(t *testing.T) {
 	}
 	// The same pre-block model always draws the same arm. A clone does too.
 	other := newCrew(c.cost.Clone(), 32, chainEnv(64, independentPrev(64), 100000))
-	if got := other.begin(32); got != 1 {
+	if got := other.begin(32); got != 4 {
 		t.Fatalf("clone opening %d", got)
+	}
+}
+
+func TestColdArmFollowsStructure(t *testing.T) {
+	wide := newCrew(NewCostPrior(), 32, chainEnv(64, independentPrev(64), 100000))
+	if got := wide.begin(32); got != coldArmCap {
+		t.Fatalf("independent block %d, want %d", got, coldArmCap)
+	}
+	// One contract and many senders is still parallel. chainEnv shares a
+	// callee; the cap is sender chains and the frontier, not that callee.
+	n := 64
+	prev := make([]int, n)
+	for i := range prev {
+		prev[i] = -1
+	}
+	for i := 2; i < n; i++ {
+		prev[i] = i - 2
+	}
+	two := newCrew(NewCostPrior(), 32, chainEnv(n, prev, 100000))
+	if got := two.begin(32); got != 2 {
+		t.Fatalf("two sender chains %d, want 2", got)
+	}
+	senders := make([]common.Address, n)
+	for i := range senders {
+		senders[i] = common.Address{1}
+	}
+	env := chainEnv(n, independentPrev(n), 100000)
+	env.Senders = senders
+	one := newCrew(NewCostPrior(), 32, env)
+	if got := one.begin(32); got != 1 {
+		t.Fatalf("one sender %d, want 1", got)
+	}
+}
+
+func TestExploreDoesNotJumpPastNeighbors(t *testing.T) {
+	cost := NewCostPrior()
+	cost.ObserveArm(1, 8_000_000, 1_000_000)
+	cost.ObserveArm(4, 5_000_000, 1_000_000)
+	arms := armGrid(32)
+	saw2, saw8 := false, false
+	for i := 0; i < 24; i++ {
+		a := cost.pick(arms, cost.refRate(), 16)
+		if a >= 16 && cost.arms[8].n == 0 {
+			t.Fatalf("picked %d before C=8 had a sample", a)
+		}
+		if a == 32 && cost.arms[16].n == 0 {
+			t.Fatalf("picked 32 before C=16 had a sample")
+		}
+		if a == 2 {
+			saw2 = true
+		}
+		if a == 8 {
+			saw8 = true
+		}
+		if cost.arms[a].n == 0 {
+			cost.ObserveArm(a, 9_000_000, 1_000_000)
+		}
+	}
+	if !saw2 || !saw8 {
+		t.Fatalf("neighbors not tried, 2=%v 8=%v", saw2, saw8)
 	}
 }
 
@@ -271,10 +331,9 @@ func TestTinyBlockRunsOne(t *testing.T) {
 	}
 	cost.startupNs = 1
 	big := newCrew(cost.Clone(), 4, chainEnv(64, independentPrev(64), 100000))
-	// No arm samples other than the serial rate living on the field, and
-	// anySample is false, so this is still the prior mean: C=1. The point
-	// is that it is not the tiny rule. A measured C=4 then wins.
-	if got := big.begin(4); got != 1 {
+	// No arm samples, so this is the structural cold arm, not the tiny
+	// rule. A measured C=4 then wins the same way.
+	if got := big.begin(4); got != 4 {
 		t.Fatalf("unsampled large block %d", got)
 	}
 	armed := newCrew(preferArm(4), 4, chainEnv(64, independentPrev(64), 100000))
@@ -360,6 +419,11 @@ func TestShrinkDoesNotRetargetReward(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		c.observe(-1, 0, 1, 0, false, 0, 0)
 	}
+	if c.Active() != 4 {
+		t.Fatalf("shrunk before %s, active %d widthC %d", shrinkHold, c.Active(), c.widthC)
+	}
+	clk.t = clk.t.Add(shrinkHold)
+	c.observe(-1, 0, 1, 0, false, 0, 0)
 	if c.Active() >= 4 {
 		t.Fatalf("smoothed width did not shrink, active %d widthC %d", c.Active(), c.widthC)
 	}
@@ -380,6 +444,30 @@ func TestShrinkDoesNotRetargetReward(t *testing.T) {
 	}
 	if cost.arms[1].n != n1 {
 		t.Fatalf("shrunk count took a sample, n %v", cost.arms[1].n)
+	}
+}
+
+func TestShrinkWaitsOutPendingReexec(t *testing.T) {
+	c := newCrew(preferArm(4), 4, chainEnv(64, independentPrev(64), 100000))
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	c.setClock(clk.now)
+	if got := c.begin(4); got != 4 {
+		t.Fatalf("start %d", got)
+	}
+	c.pendingReexec = 2
+	for i := 0; i < 8; i++ {
+		clk.t = clk.t.Add(shrinkHold)
+		c.observe(-1, 0, 1, 0, false, 0, 0)
+	}
+	if c.Active() != 4 {
+		t.Fatalf("shrunk while re-exec was pending, active %d", c.Active())
+	}
+	c.pendingReexec = 0
+	c.observe(-1, 0, 1, 0, false, 0, 0)
+	clk.t = clk.t.Add(shrinkHold)
+	c.observe(-1, 0, 1, 0, false, 0, 0)
+	if c.Active() >= 4 {
+		t.Fatalf("did not shrink after the retry drained, active %d widthC %d", c.Active(), c.widthC)
 	}
 }
 

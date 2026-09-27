@@ -366,6 +366,27 @@ type sched struct {
 	advancing      bool
 	advanceWaiters int
 	pendingSafe    []rfstate.Key
+	// idleWaiters is the number of workers blocked in Step, waiting for a task.
+	idleWaiters int
+	// reexecPending counts attempts that still have to undo a speculative
+	// write before they can commit. Shrink holds while this is non-zero.
+	reexecPending int
+	// done wakes the coordinator in wait. adv wakes a finish that is queued
+	// behind another tryAdvance. cv wakes workers. One condition for all
+	// three made every commit broadcast every idle worker.
+	done *sync.Cond
+	adv  *sync.Cond
+	// testDuringUnlock runs while s.mu is dropped inside coinbase validation.
+	// Production leaves it nil.
+	testDuringUnlock func()
+}
+
+// finalSnap is a transaction marked final, plus the read keys copied while
+// this goroutine still owned that attempt. The copy must happen before any
+// path that drops s.mu: the touch map is then free for a re-execution.
+type finalSnap struct {
+	tx    int
+	reads []rfstate.Key
 }
 
 func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *rfstate.Learner) *sched {
@@ -377,6 +398,8 @@ func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *r
 		txs:     make([]txRec, len(env.Txs)),
 	}
 	s.cv = sync.NewCond(&s.mu)
+	s.done = sync.NewCond(&s.mu)
+	s.adv = sync.NewCond(&s.mu)
 	s.ledger = rfstate.NewLedger(len(env.Txs), learner, s.onVictim)
 	s.jumps = core.NewJumpDestCache()
 	s.nextSame = make([]int, len(s.txs))
@@ -496,7 +519,7 @@ func (s *sched) wait() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for !s.doneLocked() {
-		s.cv.Wait()
+		s.done.Wait()
 	}
 	return s.fatal
 }
@@ -517,7 +540,9 @@ func (s *sched) Step(worker int) {
 		idx := s.pickLocked()
 		if idx < 0 {
 			start := time.Now()
+			s.idleWaiters++
 			s.cv.Wait()
+			s.idleWaiters--
 			s.ctr.IdleNs += time.Since(start).Nanoseconds()
 			continue
 		}
@@ -581,7 +606,7 @@ func (s *sched) execute(worker, idx int, attempt uint64, ff int) {
 				if s.txs[idx].attempt == attempt {
 					s.txs[idx].evm = nil
 				}
-				s.cv.Broadcast()
+				s.noteLocked(0, false)
 				s.mu.Unlock()
 				return
 			}
@@ -600,7 +625,7 @@ func (s *sched) execute(worker, idx int, attempt uint64, ff int) {
 	s.mu.Lock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
 		s.inflight--
-		s.cv.Broadcast()
+		s.noteLocked(0, true)
 		s.mu.Unlock()
 		return
 	}
@@ -632,6 +657,11 @@ func (s *sched) prepare(idx int) {
 	s.mu.Lock()
 	retract := s.txs[idx].retract
 	estimate := s.txs[idx].estimate
+	if retract || estimate {
+		if s.reexecPending > 0 {
+			s.reexecPending--
+		}
+	}
 	s.txs[idx].retract = false
 	s.txs[idx].estimate = false
 	s.mu.Unlock()
@@ -654,7 +684,7 @@ func (s *sched) superseded(idx int, attempt uint64) bool {
 		s.txs[idx].evm = nil
 	}
 	s.inflight--
-	s.cv.Broadcast()
+	s.noteLocked(0, true)
 	return true
 }
 
@@ -697,7 +727,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 	defer s.mu.Unlock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
 		s.inflight--
-		s.cv.Broadcast()
+		s.noteLocked(0, true)
 		return
 	}
 	if s.txs[idx].abort.Load() {
@@ -706,6 +736,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 	s.inflight--
 	s.ctr.Rollbacks++
 	s.txs[idx].evm = nil
+	ready := 0
 	switch sig.Kind {
 	case rfstate.SigWaitFinal, rfstate.SigWaitEstimate, rfstate.SigWaitPrefix:
 		s.noteWaitLocked(sig.Kind)
@@ -727,6 +758,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 			s.txs[idx].status = stReady
 			s.refreshWidthLocked(idx)
 			s.txs[idx].settledSpins++
+			ready++
 			if s.txs[idx].settledSpins > maxSettledSpins {
 				s.fatal = fmt.Errorf("block %d tx %d spinning on settled producer (signal %d depend %d)", s.env.Number, idx, sig.Kind, sig.Depend)
 			}
@@ -738,18 +770,19 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 		// attempt is still in the ledger. The retry must drop it before
 		// those bytes can be folded; a later incarnation may not write the key.
 		if s.mode == rfstate.ModeRF {
-			s.txs[idx].retract = true
+			s.markRedoLocked(idx, false)
 		}
 	default:
 		s.noteReexecLocked(idx)
 		s.requeueRunningLocked(idx)
+		ready++
 	}
 	if s.txs[idx].attempt > maxAttempts {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts (last signal %d depend %d)", s.env.Number, idx, maxAttempts, sig.Kind, sig.Depend)
 	}
-	s.wakeLocked()
+	ready += s.wakeLocked()
 	applyN, doApply = s.crewSampleLocked(-1, 0, false)
-	s.cv.Broadcast()
+	s.noteLocked(ready, true)
 }
 
 // noteReexecLocked records the aborted attempt on the key that invalidated
@@ -792,14 +825,14 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 	defer s.mu.Unlock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
 		s.inflight--
-		s.cv.Broadcast()
+		s.noteLocked(0, true)
 		return
 	}
 	s.inflight--
 	s.txs[idx].evm = nil
 	if s.txs[idx].lowerFinal {
 		s.fatal = fmt.Errorf("block %d tx %d: %w", s.env.Number, idx, err)
-		s.cv.Broadcast()
+		s.noteLocked(0, false)
 		return
 	}
 	s.ctr.Rollbacks++
@@ -822,10 +855,10 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 			// Same as a fence wait: this attempt's early publishes did not
 			// roll back with the EVM journal.
 			if s.mode == rfstate.ModeRF {
-				s.txs[idx].retract = true
+				s.markRedoLocked(idx, false)
 			}
-			s.wakeLocked()
-			s.cv.Broadcast()
+			ready := s.wakeLocked()
+			s.noteLocked(ready, true)
 			return
 		}
 	}
@@ -833,9 +866,9 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 	if s.txs[idx].attempt > maxAttempts {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts: %w", s.env.Number, idx, maxAttempts, err)
 	}
-	s.wakeLocked()
+	ready := 1 + s.wakeLocked()
 	applyN, doApply = s.crewSampleLocked(-1, 0, false)
-	s.cv.Broadcast()
+	s.noteLocked(ready, true)
 }
 
 func (s *sched) discard(idx int, attempt uint64) {
@@ -851,7 +884,7 @@ func (s *sched) discard(idx int, attempt uint64) {
 	defer s.mu.Unlock()
 	if s.txs[idx].attempt != attempt || s.txs[idx].status != stRunning {
 		s.inflight--
-		s.cv.Broadcast()
+		s.noteLocked(0, true)
 		return
 	}
 	s.inflight--
@@ -862,9 +895,9 @@ func (s *sched) discard(idx int, attempt uint64) {
 	if s.txs[idx].attempt > maxAttempts {
 		s.fatal = fmt.Errorf("block %d tx %d exceeded %d attempts", s.env.Number, idx, maxAttempts)
 	}
-	s.wakeLocked()
+	ready := 1 + s.wakeLocked()
 	applyN, doApply = s.crewSampleLocked(-1, 0, false)
-	s.cv.Broadcast()
+	s.noteLocked(ready, true)
 }
 
 func (s *sched) requeueRunningLocked(idx int) {
@@ -876,11 +909,7 @@ func (s *sched) requeueRunningLocked(idx int) {
 	s.txs[idx].preds = nil
 	s.txs[idx].status = stReady
 	s.refreshWidthLocked(idx)
-	if s.mode == rfstate.ModeOCC {
-		s.txs[idx].estimate = true
-	} else {
-		s.txs[idx].retract = true
-	}
+	s.markRedoLocked(idx, s.mode == rfstate.ModeOCC)
 }
 
 func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *core.ExecutionResult) {
@@ -920,14 +949,22 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 	s.refreshWidthLocked(idx)
 	s.txs[idx].evm = nil
 	s.inflight--
+	// touch[idx] is owned by this attempt only while status stays finished
+	// and no other goroutine has been allowed to pick idx. tryAdvanceLocked
+	// drops s.mu (another finish waiting on adv, and coinPredsValid). In
+	// that window an invalidation re-executes idx and writes the same map.
+	// Copy first. The attempt number is the generation: after the window
+	// the live map may belong to the next attempt, so noteIO keeps this copy.
+	var selfReads []rfstate.Key
+	if s.crew != nil {
+		selfReads = s.ledger.ReadKeys(idx)
+	}
 	finalTx := s.tryAdvanceLocked()
-	// Copy read keys before unlock. ClearVersions runs as soon as wait()
-	// observes a finished block, and a worker can still be in finish then.
 	var safe []rfstate.Key
 	learnNow := false
 	if s.learner != nil {
-		for _, tx := range finalTx {
-			safe = append(safe, s.ledger.ReadKeys(tx)...)
+		for _, fin := range finalTx {
+			safe = append(safe, fin.reads...)
 		}
 		if s.deferLearn() {
 			s.pendingSafe = append(s.pendingSafe, safe...)
@@ -938,7 +975,7 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 	gas := result.UsedGas
 	wrote := view.WroteKeys()
 	if s.crew != nil {
-		s.crew.noteIO(idx, s.ledger.ReadKeys(idx), wrote)
+		s.crew.noteIO(idx, selfReads, wrote)
 	}
 	if s.learner != nil && s.mode == rfstate.ModeRF && !s.txs[idx].attemptStart.IsZero() {
 		if ns := time.Since(s.txs[idx].attemptStart).Nanoseconds(); ns > 0 {
@@ -952,28 +989,27 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 		}
 	}
 	applyN, doApply = s.crewSampleLocked(idx, gas, true)
-	s.wakeLocked()
-	s.cv.Broadcast()
+	s.noteLocked(s.wakeLocked(), true)
 	s.mu.Unlock()
 	if learnNow {
 		s.learner.ObserveSafeBatch(safe)
 	}
 }
 
-func (s *sched) tryAdvanceLocked() []int {
+func (s *sched) tryAdvanceLocked() []finalSnap {
 	for s.advancing {
 		s.advanceWaiters++
-		s.cv.Wait()
+		s.adv.Wait()
 		s.advanceWaiters--
 	}
 	s.advancing = true
 	defer func() {
 		s.advancing = false
 		if s.advanceWaiters > 0 {
-			s.cv.Broadcast()
+			s.adv.Broadcast()
 		}
 	}()
-	var finalTx []int
+	var finalTx []finalSnap
 	for s.frontier < len(s.txs) {
 		t := &s.txs[s.frontier]
 		if t.status == stFinal {
@@ -1021,7 +1057,10 @@ func (s *sched) tryAdvanceLocked() []int {
 		}
 		t = &s.txs[tx]
 		if s.mode == rfstate.ModeRF {
-			finalTx = append(finalTx, tx)
+			// Still stFinished under s.mu, so no re-execution is inside
+			// noteRead. A later unlock in this loop cannot restart a
+			// final transaction. Copy before that unlock.
+			finalTx = append(finalTx, finalSnap{tx: tx, reads: s.ledger.ReadKeys(tx)})
 		}
 		t.status = stFinal
 		s.frontier++
@@ -1040,6 +1079,9 @@ func (s *sched) coinPredsValid(tx int) bool {
 	preds := append([]rfstate.CoinPred(nil), s.txs[tx].preds...)
 	coin := s.env.Header.Coinbase
 	s.mu.Unlock()
+	if s.testDuringUnlock != nil {
+		s.testDuringUnlock()
+	}
 	ok := true
 	for _, p := range preds {
 		own := new(uint256.Int).Set(&p.OwnFee)
@@ -1079,11 +1121,7 @@ func (s *sched) requeueFinishedLocked(idx int) {
 	s.txs[idx].validated = false
 	s.txs[idx].preds = nil
 	s.txs[idx].status = stReady
-	if s.mode == rfstate.ModeOCC {
-		s.txs[idx].estimate = true
-	} else {
-		s.txs[idx].retract = true
-	}
+	s.markRedoLocked(idx, s.mode == rfstate.ModeOCC)
 	if s.frontier > idx {
 		s.frontier = idx
 	}
@@ -1112,7 +1150,49 @@ func (s *sched) crewSampleLocked(tx int, gas uint64, done bool) (int, bool) {
 	}
 	w := s.widthNowLocked()
 	s.width = w
+	s.crew.pendingReexec = s.reexecPending
 	return s.crew.observe(tx, s.frontier, w, gas, done, s.ctr.Rollbacks, s.ctr.IdleNs)
+}
+
+// markRedoLocked records that the next prepare of idx must drop a
+// speculative version. The counter stays up until that prepare runs, so a
+// shrink does not cut workers while the retry is still queued.
+func (s *sched) markRedoLocked(idx int, estimate bool) {
+	if idx < 0 || idx >= len(s.txs) {
+		return
+	}
+	if !s.txs[idx].retract && !s.txs[idx].estimate {
+		s.reexecPending++
+	}
+	if estimate {
+		s.txs[idx].estimate = true
+	} else {
+		s.txs[idx].retract = true
+	}
+}
+
+// noteLocked wakes one idle worker per newly ready task, or every waiter
+// when the block can finish. The caller may also return to Step and take
+// one of those tasks. Signaling every idle worker makes the runtime spin
+// processors that wake up and find nothing. The ready count is not reduced
+// for the caller: a worker that is above the active count returns from
+// Step without picking, and dropping its wakeup would leave the task idle.
+func (s *sched) noteLocked(ready int, _ bool) {
+	if s.doneLocked() {
+		s.done.Broadcast()
+		s.cv.Broadcast()
+		if s.advanceWaiters > 0 {
+			s.adv.Broadcast()
+		}
+		return
+	}
+	n := ready
+	if n > s.idleWaiters {
+		n = s.idleWaiters
+	}
+	for i := 0; i < n; i++ {
+		s.cv.Signal()
+	}
 }
 
 // coinFeeValidLocked reports that a coinbase read, if any, still matches
@@ -1170,13 +1250,17 @@ func (s *sched) applyActive(n int, gen uint64) {
 		s.mask.shrink(gen, n)
 	}
 	s.mu.Lock()
+	// One wake of every idle worker, and only because the active count
+	// changed. Per-transaction completion uses noteLocked instead, so a
+	// wide arm does not make every parked worker runnable.
 	if s.pool.Generation() == gen && !s.doneLocked() {
 		s.cv.Broadcast()
 	}
 	s.mu.Unlock()
 }
 
-func (s *sched) wakeLocked() {
+func (s *sched) wakeLocked() int {
+	n := 0
 	for i := range s.txs {
 		if s.txs[i].status != stParked {
 			continue
@@ -1194,7 +1278,9 @@ func (s *sched) wakeLocked() {
 		}
 		s.txs[i].status = stReady
 		s.refreshWidthLocked(i)
+		n++
 	}
+	return n
 }
 
 func (s *sched) onVictim(v rfstate.Victim) {
@@ -1255,7 +1341,6 @@ func (s *sched) armLocked(tx int, attempt uint64) *vm.EVM {
 	ev := t.evm
 	if t.status == stRunning {
 		t.abort.Store(true)
-		s.cv.Broadcast()
 		return ev
 	}
 	t.attempt++
@@ -1264,17 +1349,13 @@ func (s *sched) armLocked(tx int, attempt uint64) *vm.EVM {
 	t.validated = false
 	t.preds = nil
 	t.status = stReady
-	if s.mode == rfstate.ModeOCC {
-		t.estimate = true
-	} else {
-		t.retract = true
-	}
+	s.markRedoLocked(tx, s.mode == rfstate.ModeOCC)
 	if s.frontier > tx {
 		s.frontier = tx
 	}
 	s.refreshWidthLocked(tx)
-	s.wakeLocked()
-	s.cv.Broadcast()
+	// The publisher is still inside execute, so it will not pick this task.
+	s.noteLocked(1+s.wakeLocked(), false)
 	return ev
 }
 

@@ -53,6 +53,19 @@ const (
 	tinyTxCold = 48
 	// startupInit is the bootstrap parallel-startup estimate, in nanoseconds.
 	startupInit = 2.5e6
+	// coldArmCap is the widest arm a block with no samples may open on.
+	// Wider rungs are reached one grid step at a time, after a neighbor
+	// has a sample. C=4 is wide enough for a heavy independent block and
+	// cheap to be wrong about; C=32 is not.
+	coldArmCap = 4
+	// exploreEvery forces one untried neighbor of the current winner.
+	// Thompson alone left arms 2 and 8 unsampled once C=4 had pulled ahead,
+	// and a lucky draw still jumped to 16 or 32.
+	exploreEvery = 4
+	// shrinkHold is how long the smoothed frontier must stay below the
+	// active count before the guard drops a worker. A single narrow sample
+	// used to latch 4→2→1 for the rest of a heavy block.
+	shrinkHold = 8 * time.Millisecond
 )
 
 type selStat struct {
@@ -90,7 +103,8 @@ type armStat struct {
 //
 // The structural critical path is only a prior feature. An untried arm's
 // mean is ref * priorRatio, which is above the serial rate. With no
-// samples the draw is that mean with no noise, so the first block is C=1.
+// samples the arm is the block's own structure (frontier, sender chains),
+// capped at coldArmCap, not a Thompson draw and not C=1.
 type CostPrior struct {
 	Chosen     int
 	arms       map[int]armStat
@@ -115,7 +129,7 @@ type selKey struct {
 }
 
 // NewCostPrior is a cold model. No arm has a sample, so the first block
-// follows the prior mean and starts at one worker.
+// takes coldArm from the block's structure instead of a draw.
 func NewCostPrior() *CostPrior {
 	return &CostPrior{
 		arms:      map[int]armStat{},
@@ -251,35 +265,42 @@ func (c *CostPrior) posterior(arm int, ref, speedup float64) (mean, std float64)
 	return mean, std
 }
 
-// pick minimises a Thompson draw once any arm has a sample. With no
-// samples it minimises the prior mean, so a cold model does not open at
-// the cap. Equal draws keep the smaller arm.
+// pick minimises a Thompson draw over arms that already have a sample and
+// their grid neighbors. An untried rung past that neighborhood is not a
+// candidate: its prior is not a measurement, and a draw used to land on
+// C=32 from a model that had only tried 4. Every exploreEvery-th call
+// replaces a sampled winner with one untried neighbor, the one with the
+// lower pessimistic mean, so arms 2 and 8 are actually run once. Equal
+// draws keep the smaller arm. With no samples the caller uses coldArm.
 func (c *CostPrior) pick(arms []int, ref, speedup float64) int {
 	if c == nil || len(arms) == 0 {
 		return 1
 	}
-	var rng *rand.Rand
-	if c.anySample() {
-		c.step++
-		rng = rand.New(rand.NewPCG(1, c.step))
-	}
-	best := arms[0]
+	c.step++
+	eligible := eligibleArms(arms, c)
+	rng := rand.New(rand.NewPCG(1, c.step))
+	best := eligible[0]
 	bestV := math.MaxFloat64
-	for _, a := range arms {
+	for _, a := range eligible {
 		if a < 1 {
 			continue
 		}
 		mean, std := c.posterior(a, ref, speedup)
 		v := mean
-		if rng != nil && std > 0 {
+		if c.anySample() && std > 0 {
 			v = mean + std*rng.NormFloat64()
 			if v < 0 {
 				v = 0
 			}
 		}
-		if v < bestV {
+		if v < bestV || (v == bestV && a < best) {
 			bestV = v
 			best = a
+		}
+	}
+	if c.anySample() && c.step%exploreEvery == 0 {
+		if alt, ok := c.exploreNeighbor(arms, best, ref, speedup); ok {
+			best = alt
 		}
 	}
 	if best < 1 {
@@ -287,6 +308,85 @@ func (c *CostPrior) pick(arms []int, ref, speedup float64) int {
 	}
 	c.Chosen = best
 	return best
+}
+
+// eligibleArms is the sampled rungs plus one untried step on either side.
+// A cap of 32 with samples only at 1 and 4 may try 2 and 8. It may not try 32.
+func eligibleArms(grid []int, c *CostPrior) []int {
+	if c == nil || !c.anySample() || len(grid) == 0 {
+		return grid
+	}
+	ok := make([]bool, len(grid))
+	for i, a := range grid {
+		if !c.sampled(a) {
+			continue
+		}
+		ok[i] = true
+		if i > 0 {
+			ok[i-1] = true
+		}
+		if i+1 < len(grid) {
+			ok[i+1] = true
+		}
+	}
+	out := make([]int, 0, len(grid))
+	for i, a := range grid {
+		if ok[i] {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return grid
+	}
+	return out
+}
+
+func (c *CostPrior) sampled(arm int) bool {
+	if c == nil || c.arms == nil {
+		return false
+	}
+	return c.arms[arm].n > 0
+}
+
+// exploreNeighbor is one untried grid step off a sampled winner. The
+// cheaper prior mean goes first, so C=2 is tried before C=8. Once that
+// neighbor has a sample it drops out and the next step becomes eligible.
+func (c *CostPrior) exploreNeighbor(grid []int, winner int, ref, speedup float64) (int, bool) {
+	if c == nil || !c.sampled(winner) {
+		return 0, false
+	}
+	idx := -1
+	for i, a := range grid {
+		if a == winner {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return 0, false
+	}
+	best := 0
+	bestMean := math.MaxFloat64
+	consider := func(i int) {
+		if i < 0 || i >= len(grid) {
+			return
+		}
+		a := grid[i]
+		if a < 1 || c.sampled(a) {
+			return
+		}
+		mean, _ := c.posterior(a, ref, speedup)
+		if mean < bestMean || (mean == bestMean && (best == 0 || a < best)) {
+			bestMean = mean
+			best = a
+		}
+	}
+	consider(idx - 1)
+	consider(idx + 1)
+	if best == 0 {
+		return 0, false
+	}
+	return best, true
 }
 
 // tooSmall reports that parallel startup is not worth paying. Before a
@@ -412,34 +512,37 @@ func ema(prev, sample, alpha float64) float64 {
 
 // crew plans the active worker count for one block.
 //
-// begin picks one arm and that arm is Best for the whole block. observe
-// only shrinks: smoothed frontier below the active count, the last two
-// transactions, an abort storm, or sustained idle. None of those rewrite
-// Best or attribute the body to a different arm. A block whose opening
-// arm is 1 never grows, so the scheduler may take the solo path.
+// begin picks one arm and that arm is Best for the whole block. With no
+// samples the arm is coldArm. observe only shrinks: a frontier that stays
+// below the active count for shrinkHold (not while a retry is queued), the
+// last two transactions, an abort storm, or sustained idle. None of those
+// rewrite Best or attribute the body to a different arm. A block whose
+// opening arm is 1 never grows, so the scheduler may take the solo path.
 type crew struct {
-	cost      *CostPrior
-	limit     int
-	n         int
-	txs       []*types.Transaction
-	prev      []int
-	senders   []common.Address
-	weight    []float64
-	active    int
-	bestC     int
-	bodyGas   uint64
-	frontier  int
-	widthE    float64
-	widthC    int
-	liveWidth int
-	finals    int
-	limitSum  float64
-	tail      bool
-	noClimb   bool
-	rewarded  bool
-	rolls     uint64
-	execs     uint64
-	trace     []int
+	cost          *CostPrior
+	limit         int
+	n             int
+	txs           []*types.Transaction
+	prev          []int
+	senders       []common.Address
+	weight        []float64
+	active        int
+	bestC         int
+	bodyGas       uint64
+	frontier      int
+	widthE        float64
+	widthC        int
+	liveWidth     int
+	finals        int
+	limitSum      float64
+	tail          bool
+	noClimb       bool
+	rewarded      bool
+	pendingReexec int
+	narrowAt      time.Time
+	rolls         uint64
+	execs         uint64
+	trace         []int
 
 	clock    func() time.Time
 	bodyAt   time.Time
@@ -509,7 +612,11 @@ func (c *crew) begin(width int) int {
 	grid := armGrid(c.limit)
 	picked := 1
 	if c.cost != nil && !c.cost.tooSmall(c.n, gasEst) {
-		picked = c.cost.pick(grid, ref, speedup)
+		if !c.cost.anySample() {
+			picked = c.coldArm(grid, c.widthC)
+		} else {
+			picked = c.cost.pick(grid, ref, speedup)
+		}
 	}
 	if picked > c.widthC {
 		picked = gridFloor(grid, c.widthC)
@@ -525,6 +632,86 @@ func (c *crew) begin(width int) int {
 	c.trace = []int{picked}
 	c.snapshotPlan(picked, ref, speedup, gasEst)
 	return picked
+}
+
+// coldArm is the opening worker count when no arm has a sample.
+//
+// The probe is the opening frontier width: ready transactions that are
+// not blocked on an earlier one from the same sender, counted before any
+// worker runs. Distinct sender addresses (or PrevSame chain heads, when
+// senders were not recovered) cap that probe. Distinct contracts do not.
+// One router address with many senders is still parallel; a single sender
+// is already a chain of length 1. The result stays on the grid and never
+// above coldArmCap. Gas and transaction count are the tooSmall check in
+// begin, which returns 1 before this function runs.
+func (c *crew) coldArm(grid []int, width int) int {
+	par := width
+	senders := c.distinctSenders()
+	if senders < par {
+		par = senders
+	}
+	if par > coldArmCap {
+		par = coldArmCap
+	}
+	if par < 2 {
+		return 1
+	}
+	return gridFloor(grid, par)
+}
+
+// distinctSenders is unique sender addresses, or PrevSame chain heads when
+// the block did not carry senders.
+func (c *crew) distinctSenders() int {
+	if c == nil || c.n < 1 {
+		return 0
+	}
+	if len(c.senders) == 0 {
+		return c.senderChains()
+	}
+	seen := map[common.Address]struct{}{}
+	n := 0
+	limit := c.n
+	if limit > len(c.senders) {
+		limit = len(c.senders)
+	}
+	for i := 0; i < limit; i++ {
+		a := c.senders[i]
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		n++
+	}
+	if n < 1 {
+		return c.senderChains()
+	}
+	return n
+}
+
+func (c *crew) senderChains() int {
+	if c == nil || c.n < 1 {
+		return 0
+	}
+	if len(c.prev) == 0 {
+		return c.n
+	}
+	n := 0
+	limit := c.n
+	if limit > len(c.prev) {
+		limit = len(c.prev)
+	}
+	for i := 0; i < limit; i++ {
+		if c.prev[i] < 0 {
+			n++
+		}
+	}
+	if c.n > len(c.prev) {
+		n += c.n - len(c.prev)
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // gridFloor is the greatest arm in grid that is still <= width.
@@ -670,15 +857,40 @@ func (c *crew) observe(tx, frontier, width int, gas uint64, done bool, rolls uin
 			}
 		}
 	}
-	if c.widthC < c.active {
-		c.noClimb = true
-		n := c.widthC
-		if n < 1 {
-			n = 1
+	// Width shrinks one half-step after every sample in the hold has been
+	// narrower than the active count, and the smoothed width agrees.
+	// One narrow sample used to latch 4 straight to 1. A sample that
+	// fills the active count clears the timer. Re-exec work does too.
+	// The tail path above is unchanged.
+	if c.pendingReexec > 0 || width >= c.active {
+		c.narrowAt = time.Time{}
+	} else {
+		now := c.now()
+		if c.narrowAt.IsZero() {
+			c.narrowAt = now
 		}
-		return c.apply(n)
+		smoothed := c.widthC < c.active && c.widthE < float64(c.active)
+		if smoothed && !now.Before(c.narrowAt.Add(shrinkHold)) {
+			c.noClimb = true
+			n := c.half()
+			if c.widthC > n {
+				n = c.widthC
+			}
+			if n < 1 {
+				n = 1
+			}
+			c.narrowAt = time.Time{}
+			return c.apply(n)
+		}
 	}
 	return c.active, false
+}
+
+func (c *crew) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
 }
 
 func (c *crew) bodyElapsed() int64 {
