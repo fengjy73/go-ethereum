@@ -59,20 +59,39 @@ type Posterior struct {
 	Multi  uint64
 }
 
-// Learner holds per-key Beta posteriors. P0 decides greedily by comparing
-// expected PASS cost with expected WAIT_FINAL cost. Replay and wait costs
-// start equal, so the rule reduces to "wait when the posterior mean exceeds
-// one half and a lower producer is already known". Costs stay equal in P0
-// (Thompson sampling and measured costs are P1).
+// Cold costs are unitless and never satisfy E[wait] < P(conflict)*E[reexec],
+// because a conflict probability cannot exceed 1 and the wait prior is 4.
+// A fence is chosen only after both sides have a nanosecond estimate.
+const (
+	priorWait   = 4.0
+	priorReexec = 1.0
+	costAlpha   = 0.2
+	costCap     = 100.0
+)
+
+// keyCost is the learned wait, re-execution, and producer duration for one key.
+// It lives beside the Beta posterior so a duration sample does not insert a
+// conflict posterior (that would let safe reads drift a key that only produced).
+type keyCost struct {
+	waitV, waitN     float64
+	reexecV, reexecN float64
+	prodV, prodN     float64
+}
+
+// Learner holds per-key Beta posteriors. WAIT_FINAL is chosen only when a
+// lower producer exists and the expected wait is strictly cheaper than the
+// expected re-execution it avoids. Until both costs are measured in
+// nanoseconds the choice is PASS.
 type Learner struct {
 	mu        sync.Mutex
 	post      map[Key]Posterior
+	cost      map[Key]keyCost
 	anyFenced atomic.Uint32 // 1 once any key has Conflicts > 0
 }
 
 // NewLearner returns an empty learner (every key uses the global prior).
 func NewLearner() *Learner {
-	return &Learner{post: map[Key]Posterior{}}
+	return &Learner{post: map[Key]Posterior{}, cost: map[Key]keyCost{}}
 }
 
 // Clone returns a deep copy. Timed runs restore this snapshot so a block's
@@ -83,9 +102,15 @@ func (l *Learner) Clone() *Learner {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	n := &Learner{post: make(map[Key]Posterior, len(l.post))}
+	n := &Learner{
+		post: make(map[Key]Posterior, len(l.post)),
+		cost: make(map[Key]keyCost, len(l.cost)),
+	}
 	for k, v := range l.post {
 		n.post[k] = v
+	}
+	for k, v := range l.cost {
+		n.cost[k] = v
 	}
 	n.anyFenced.Store(l.anyFenced.Load())
 	return n
@@ -120,21 +145,100 @@ func (l *Learner) Fenced(k Key) bool {
 }
 
 // Choose picks PASS or WAIT_FINAL. Coinbase and nonce are decided by the caller.
+//
+// E[pass] = P(conflict) * E[reexec], E[wait] = E[wait]. Wait only when the
+// wait is strictly cheaper. A missing nanosecond estimate on either side
+// is PASS: the unitless prior (wait 4, reexec 1) cannot satisfy the
+// inequality, and mixing it with a one-sided nanosecond sample would fence
+// every key after a single long replay.
 func (l *Learner) Choose(k Key, hasProducer bool) Fence {
 	if l == nil || !hasProducer {
 		return FencePass
 	}
 	l.mu.Lock()
 	p := l.get(k)
+	wait, reexec, ok := l.costsLocked(k)
 	l.mu.Unlock()
-	// E[C_pass] = P_c * replayCost, E[C_wait] = (1-P_c) * waitCost,
-	// replayCost = waitCost = 1 in P0.
+	if !ok {
+		return FencePass
+	}
 	pc := p.Alpha / (p.Alpha + p.Beta)
-	if pc > 0.5 {
+	if wait < pc*reexec {
 		return FenceWaitFinal
 	}
 	return FencePass
 }
+
+// costsLocked reports nanosecond estimates. The wait is the measured park
+// time after four samples, otherwise half the producer's attempt, otherwise
+// unknown. The re-execution cost is the measured aborted attempt, otherwise
+// unknown. Caller holds mu.
+func (l *Learner) costsLocked(k Key) (wait, reexec float64, ok bool) {
+	c := l.cost[k]
+	switch {
+	case c.waitN >= 4:
+		wait = c.waitV
+	case c.prodN >= 1:
+		wait = 0.5 * c.prodV
+	default:
+		return priorWait, priorReexec, false
+	}
+	if c.reexecN < 1 {
+		return priorWait, priorReexec, false
+	}
+	return wait, c.reexecV, true
+}
+
+func observeCost(v, n *float64, sample float64) {
+	if sample < 0 {
+		return
+	}
+	if *n <= 0 {
+		*v = sample
+		*n = 1
+		return
+	}
+	*v = (*v)*(1-costAlpha) + sample*costAlpha
+	if *n < costCap {
+		*n++
+	}
+}
+
+func (l *Learner) addCost(k Key, kind int, ns int64) {
+	if l == nil || ns <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cost == nil {
+		l.cost = map[Key]keyCost{}
+	}
+	c := l.cost[k]
+	switch kind {
+	case costWait:
+		observeCost(&c.waitV, &c.waitN, float64(ns))
+	case costReexec:
+		observeCost(&c.reexecV, &c.reexecN, float64(ns))
+	case costProd:
+		observeCost(&c.prodV, &c.prodN, float64(ns))
+	}
+	l.cost[k] = c
+}
+
+const (
+	costWait = iota
+	costReexec
+	costProd
+)
+
+// ObserveWait records how long a reader actually parked on k.
+func (l *Learner) ObserveWait(k Key, ns int64) { l.addCost(k, costWait, ns) }
+
+// ObserveReexec records a conflicted attempt's wall time on k.
+func (l *Learner) ObserveReexec(k Key, ns int64) { l.addCost(k, costReexec, ns) }
+
+// ObserveProducer records a successful attempt that wrote k.
+func (l *Learner) ObserveProducer(k Key, ns int64) { l.addCost(k, costProd, ns) }
 
 // ObserveConflict records one push-invalidation against the key.
 func (l *Learner) ObserveConflict(k Key) {
@@ -249,6 +353,13 @@ func (l *Learner) ApplyDelta(before, after *Learner) {
 		dMulti  uint64
 	}
 	var rows []delta
+	var costs map[Key]keyCost
+	if after.cost != nil {
+		costs = make(map[Key]keyCost, len(after.cost))
+		for k, v := range after.cost {
+			costs[k] = v
+		}
+	}
 	for k, got := range after.post {
 		base := Posterior{Alpha: priorAlpha, Beta: priorBeta}
 		if before != nil {
@@ -291,6 +402,11 @@ func (l *Learner) ApplyDelta(before, after *Learner) {
 			l.anyFenced.Store(1)
 		}
 	}
+	// Durations are not beta counts. The timed run cloned the prior, so its
+	// cost map is that prior plus this block. Decay does not touch it.
+	if costs != nil {
+		l.cost = costs
+	}
 }
 
 // Absorb copies every posterior from src (used when a learning pass finishes).
@@ -303,9 +419,14 @@ func (l *Learner) Absorb(src *Learner) {
 	for k, v := range src.post {
 		cp[k] = v
 	}
+	cc := make(map[Key]keyCost, len(src.cost))
+	for k, v := range src.cost {
+		cc[k] = v
+	}
 	src.mu.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.post = cp
+	l.cost = cc
 	l.anyFenced.Store(src.anyFenced.Load())
 }

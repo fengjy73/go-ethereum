@@ -134,6 +134,13 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 			return time.Now(), procCPU()
 		})
 		workers = s.crew.begin(s.width)
+		// The arm is fixed for the block. Guards only shrink, so an opening
+		// of 1 never overlaps another attempt and may take the solo path.
+		// An opening above 1 stays off that path even if the guard later
+		// drops the active count to 1.
+		if workers <= 1 {
+			s.solo = true
+		}
 		// Arm before Drive so a worker cannot observe an unarmed gate.
 		// Drive's generation is the current value plus one; this coordinator
 		// is the only caller. The initial GOMAXPROCS write happens here,
@@ -194,17 +201,9 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		best = s.crew.Best()
 		_, modelC, modelPred, modelCurve = s.crew.Curve()
 		nextCost = s.crew.cost
-		// The reported curve is the opening plan. Segments fold into the
-		// clone the next block will see, including an abandoned probe.
+		// Curve is the opening plan. The body sample is folded after it,
+		// onto the arm that was chosen, with the tail left out.
 		s.crew.closeSegments()
-		var segWall uint64
-		for _, seg := range s.crew.segments {
-			segWall += seg.WallNs
-		}
-		wallNs := uint64(wall.Nanoseconds())
-		if wallNs > segWall {
-			nextCost.NoteRemainder(wallNs - segWall)
-		}
 		nextCost.NoteUtil(float64(gas), s.crew.limitSum)
 	}
 	return &Outcome{
@@ -258,9 +257,16 @@ type txRec struct {
 	reads      []rfstate.OccRead
 	park       int
 	parkKind   rfstate.SigKind
+	parkKey    rfstate.Key
+	hasParkKey bool
 	waiting    bool
 	waitStart  time.Time
-	deferNoted bool
+	// attemptStart is when this attempt left the scheduler for execute.
+	attemptStart time.Time
+	// conflictKey is the key that invalidated this attempt, if any.
+	hasConflict bool
+	conflictKey rfstate.Key
+	deferNoted  bool
 	// settledSpins counts wait signals whose producer was already done.
 	settledSpins int
 	// lowerFinal is true when this attempt started with every lower
@@ -444,6 +450,9 @@ func (s *sched) Step(worker int) {
 		attempt := s.txs[idx].attempt
 		ff := s.txs[idx].ffUntil
 		s.txs[idx].lowerFinal = s.frontier >= idx
+		s.txs[idx].attemptStart = time.Now()
+		s.txs[idx].hasConflict = false
+		s.txs[idx].hasParkKey = false
 		s.txs[idx].status = stRunning
 		s.txs[idx].abort.Store(false)
 		s.inflight++
@@ -628,6 +637,10 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 		s.txs[idx].ffUntil = sig.Seq
 		s.txs[idx].park = sig.Depend
 		s.txs[idx].parkKind = sig.Kind
+		if sig.Kind == rfstate.SigWaitFinal {
+			s.txs[idx].parkKey = sig.Key
+			s.txs[idx].hasParkKey = true
+		}
 		s.txs[idx].status = stParked
 		s.txs[idx].waiting = true
 		s.txs[idx].waitStart = time.Now()
@@ -651,6 +664,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 			s.txs[idx].retract = true
 		}
 	default:
+		s.noteReexecLocked(idx)
 		s.requeueRunningLocked(idx)
 	}
 	if s.txs[idx].attempt > maxAttempts {
@@ -659,6 +673,24 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 	s.wakeLocked()
 	applyN, doApply = s.crewSampleLocked(-1, 0, false)
 	s.cv.Broadcast()
+}
+
+// noteReexecLocked records the aborted attempt on the key that invalidated
+// it. The learner lock is not held across a scheduler acquisition anywhere,
+// so taking it here is safe. A fence park is not a re-execution: the wait
+// is recorded when the transaction is released.
+func (s *sched) noteReexecLocked(idx int) {
+	if s.learner == nil || s.mode != rfstate.ModeRF || idx < 0 || idx >= len(s.txs) {
+		return
+	}
+	t := &s.txs[idx]
+	if !t.hasConflict || t.attemptStart.IsZero() {
+		return
+	}
+	ns := time.Since(t.attemptStart).Nanoseconds()
+	if ns > 0 {
+		s.learner.ObserveReexec(t.conflictKey, ns)
+	}
 }
 
 func (s *sched) noteWaitLocked(k rfstate.SigKind) {
@@ -746,6 +778,7 @@ func (s *sched) discard(idx int, attempt uint64) {
 	}
 	s.inflight--
 	s.ctr.Rollbacks++
+	s.noteReexecLocked(idx)
 	s.txs[idx].evm = nil
 	s.requeueRunningLocked(idx)
 	if s.txs[idx].attempt > maxAttempts {
@@ -821,8 +854,20 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 		}
 	}
 	gas := result.UsedGas
+	wrote := view.WroteKeys()
 	if s.crew != nil {
-		s.crew.noteIO(idx, s.ledger.ReadKeys(idx), view.WroteKeys())
+		s.crew.noteIO(idx, s.ledger.ReadKeys(idx), wrote)
+	}
+	if s.learner != nil && s.mode == rfstate.ModeRF && !s.txs[idx].attemptStart.IsZero() {
+		if ns := time.Since(s.txs[idx].attemptStart).Nanoseconds(); ns > 0 {
+			for _, k := range wrote {
+				// Cold keys stay PASS until a conflict. Sampling every
+				// write would take the learner lock on the success path.
+				if s.learner.Fenced(k) {
+					s.learner.ObserveProducer(k, ns)
+				}
+			}
+		}
 	}
 	applyN, doApply = s.crewSampleLocked(idx, gas, true)
 	s.wakeLocked()
@@ -929,7 +974,7 @@ func (s *sched) crewSampleLocked(tx int, gas uint64, done bool) (int, bool) {
 	}
 	w := s.frontierWidthLocked()
 	s.width = w
-	return s.crew.observe(tx, s.frontier, w, gas, done, s.ctr.Rollbacks)
+	return s.crew.observe(tx, s.frontier, w, gas, done, s.ctr.Rollbacks, s.ctr.IdleNs)
 }
 
 // coinFeeValidLocked reports that a coinbase read, if any, still matches
@@ -996,7 +1041,11 @@ func (s *sched) wakeLocked() {
 			continue
 		}
 		if s.txs[i].waiting {
-			s.ctr.WaitNs += time.Since(s.txs[i].waitStart).Nanoseconds()
+			ns := time.Since(s.txs[i].waitStart).Nanoseconds()
+			s.ctr.WaitNs += ns
+			if s.learner != nil && s.txs[i].hasParkKey && ns > 0 {
+				s.learner.ObserveWait(s.txs[i].parkKey, ns)
+			}
 			s.txs[i].waiting = false
 		}
 		s.txs[i].status = stReady
@@ -1005,6 +1054,10 @@ func (s *sched) wakeLocked() {
 
 func (s *sched) onVictim(v rfstate.Victim) {
 	s.mu.Lock()
+	if v.Tx >= 0 && v.Tx < len(s.txs) && s.txs[v.Tx].attempt == v.Attempt {
+		s.txs[v.Tx].hasConflict = true
+		s.txs[v.Tx].conflictKey = v.Key
+	}
 	ev := s.armLocked(v.Tx, v.Attempt)
 	s.mu.Unlock()
 	if ev != nil {

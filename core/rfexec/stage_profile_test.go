@@ -56,16 +56,20 @@ func TestStageProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	eng := os.Getenv("RF_PROFILE_ENGINE")
+	if eng == "" {
+		eng = EngineRF
+	}
 	pool := rfstate.NewPool(nil, c)
 	defer pool.Stop()
 	// One untimed pass pays for KZG and page faults.
-	if _, err := ExecEngine(env, EngineRF, pool, c, rfstate.NewLearner()); err != nil {
+	if _, err := ExecEngine(env, eng, pool, c, rfstate.NewLearner()); err != nil {
 		t.Fatal(err)
 	}
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	out, err := ExecEngine(env, EngineRF, pool, c, rfstate.NewLearner())
+	out, err := ExecEngine(env, eng, pool, c, rfstate.NewLearner())
 	runtime.ReadMemStats(&after)
 	if err != nil {
 		t.Fatal(err)
@@ -109,13 +113,13 @@ func TestStageProfile(t *testing.T) {
 	}
 	t0 := time.Now()
 	for i := 0; i < loops; i++ {
-		if _, err := ExecEngine(env, EngineRF, pool, c, rfstate.NewLearner()); err != nil {
+		if _, err := ExecEngine(env, eng, pool, c, rfstate.NewLearner()); err != nil {
 			pprof.StopCPUProfile()
 			t.Fatal(err)
 		}
 	}
 	pprof.StopCPUProfile()
 	f.Close()
-	fmt.Printf("CPU block=%s C=%d loops=%d hz=%d profile_wall=%s file=%s gomaxprocs=%d\n",
-		block, c, loops, hz, time.Since(t0), cpuPath, runtime.GOMAXPROCS(0))
+	fmt.Printf("CPU engine=%s block=%s C=%d loops=%d hz=%d profile_wall=%s file=%s gomaxprocs=%d\n",
+		eng, block, c, loops, hz, time.Since(t0), cpuPath, runtime.GOMAXPROCS(0))
 }

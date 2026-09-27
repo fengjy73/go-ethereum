@@ -81,6 +81,17 @@
 4. **已完成** 默认不 `LockOSThread`。当前线程只对第一组 L3 做亲和提示。`-pin-coordinator` 仍可用，并在 stderr 说明 `GOMAXPROCS=C` 时更慢。README 里固定引擎是 `GOMAXPROCS=C+1`，rf-auto 不用 +1。
 5. **未改解释器** 22102250 / 26061000 / 22018250 的 C=1 差距没有新的便宜热点。2c 对 26061000 的剖面里 `Ledger.Read` 已经没有了，剩下的是解释器、keccak、jumpdest。本机 K=3 的 rf C=1/serial 是 1.223、1.132、0.860，几何平均 1.137；这不是 ict21，也不是这次砍出来的。
 
+## Stage 2e（代码已在本机测过，待用户验收）
+
+目标：rf-auto 的主信号不再是按段的 infl/base/固定开销回归。跨块用几何网格上的 Thompson sampling 选一个 C，整块体部 wall/gas 记到这个臂上；块内只允许缩小的守卫。围栏只在期望等待短于它省下的重执行时才选 `WAIT_FINAL`。同一分支 / PR #1，基线 `6b1e19701`。ict21 的 10% 目标本机不能代替。
+
+1. **已完成** 臂集合是 cap 以内的 2 的幂，再加上 cap 本身。未试过的臂先验是 `1+0.06*log2(C)^2`（C=4 约 1.24，一次大约 1.4 倍的样本就能翻；C=32 是 2.5）。没有任何样本时不开噪声，第一块是 C=1。奖励是体部 wall/gas，尾部不算，守卫缩小不改臂、不改 `CrewBest`。
+2. **已完成** 太小的块（冷启动 `nTx<48`，之后 `gas*serialRate < 2*startupNs`）整块固定 C=1 并走 Solo。守卫只缩小。
+3. **已完成** `Choose`：两边都有纳秒样本时，`E[wait] < pc * E[reexec]` 才等待。冷先验保持 PASS。
+4. **已完成测量** 本机 K=3 表和 22418000 的计数见验证记录。没有上 ict21。`WAIT_FINAL` 在 rf C=4 上几乎是 0，所以这条差距不是选错了围栏。
+
+结构模型只给先验当特征。十个块不够再按交易数分桶，后验是全体块共用的一份，外加「太小 / 其余」。
+
 ## 验证记录
 
 - `go test ./core/rfstate` 通过，含 `TestDropEstimatesRemovesUnpublishedKey`。
@@ -88,3 +99,4 @@
 - **2026-09-26 续** fixtures-b（19951808、20058000、20361898、26060000、26061000）并入 `TestFixtureEngines`。十块一次通过；`rfbench -fixtures /tmp/fixa,/tmp/fixb` 退出码 0。Osaka 系统调用沿用已有 Prague pre/post 路径，未改执行器。
 - **2026-09-27 Stage 2c** `TestFixtureEngines` 7.2s 通过。`go test -race`：`core/rfstate` 1.0s，`core/rfexec` 86.3s，退出码 0。rf-auto reset/carry K=30 各 300 行，rf C=2/4 K=30 各 300 行，C=8 K=15 共 150 行，逐次对串行通过。本机 K=3 中位数几何平均 rf C=1/serial = 1.213（stage 2b 同机是 1.35；ict21 上一次是 1.39，这次没有上 ict21）。rf-auto reset 相对每块最佳固定 rf C（1/2/4）几何平均 1.02，10 块里 7 块在 10% 内；carry 1.09，5/10。第一块 `model_pred_ns` 为 0。lint 0 issues，`check_baddeps` 通过，`make all` 退出码 0。
 - **2026-09-27 Stage 2d** `go test ./core/rfstate ./core/rfexec` 通过（含十块 `TestFixtureEngines`）。`go test -race`：`core/rfstate` 1.0s，`core/rfexec` 81.4s，退出码 0。模型单测覆盖放弃的探针、尾段、探索、热点软链、选择器收缩和固定项。`model_pred_ns` 与开块曲线上 `model_c` 的 60 行全部一致。lint 0 issues，`check_baddeps` 通过。本机 4 核、K=3、`GOMAXPROCS=C`、cpus 为 `0..C-1`、没有 `-pin-coordinator`。相对 serial 的中位数几何平均：occ 1/2/4 = 1.201/0.939/0.903，rf 1/2/4 = 1.137/0.993/0.940，rf-auto reset 1.016，carry 0.927。相对每块最佳固定 rf C：reset 几何平均 1.139（5/10 在 10% 内），carry 1.039（8/10）。预测对 wall 的块中位误差中位数：reset -5%，carry -21%；20361898 仍约 -70%（它排在学会固定项之前），22018250 carry +65%。没有上 ict21。
+- **2026-09-27 Stage 2e** 网格、悲观先验、守卫不改臂、尾部不进奖励、1.4 倍样本能采纳 C=4、以及「等待不便宜就 PASS」的单测通过。十块 `TestFixtureEngines` 通过。`go test -race`：`core/rfstate` 1.0s，`core/rfexec` 87.5s。lint 0 issues，`check_baddeps` 通过，`make all` 退出码 0。本机 4 核、K=3、`GOMAXPROCS=C`、cpus `0..C-1`、没有 `-pin-coordinator`，固定 rf 用 `-prior carry`。相对 serial 的中位数几何平均：occ 1/2/4 = 1.332/1.047/0.987，rf 1/2/4 = 1.254/1.098/1.019，rf-auto reset 1.131，carry 1.257。相对每块最佳固定 rf C：reset 几何平均 1.172（4/10 在 10% 内），carry 1.302（2/10）。第一块没有样本，臂是 1。其后 reset 多数块的臂是 4；20361898（27 笔）保持 1。22418000 上 rf C=4 的 `wait_final` 中位数是 0（三次是 1/0/0），occ C=4 是约 100 次估计等待。rf 的执行和回滚都更少，wall 中位数仍是 38ms 对 occ 的 33ms（occ/rf ≈ 0.88）。剖面里 `fence` 只占大约 2% 的样本，主要时间在解释器。没有上 ict21。

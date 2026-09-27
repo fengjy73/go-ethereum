@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -254,6 +255,10 @@ func TestEarlyWriteDroppedOnWait(t *testing.T) {
 		learner.ObserveConflict(fence)
 	}
 	learner.ObserveWriteShape(fence, true)
+	// Conflicts alone do not fence. Half of a short producer is cheaper
+	// than the likely re-execution, so this key waits.
+	learner.ObserveProducer(fence, 100)
+	learner.ObserveReexec(fence, 1000)
 	pool := rfstate.NewPool([]int{0, 1}, 2)
 	defer pool.Stop()
 	var waits int
@@ -449,8 +454,12 @@ func TestAutoPriorSurvivesFixtureTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("trace %s active %d best %d execs %d rollbacks %d idle %d", out.CTrace, out.ActiveC, out.CrewBest, out.Counters.Executions, out.Counters.Rollbacks, out.Counters.IdleNs)
-	if out.CrewBest < 2 {
-		t.Fatalf("tail drained the prior to %d trace %s", out.CrewBest, out.CTrace)
+	open := out.CTrace
+	if i := strings.IndexByte(open, '-'); i >= 0 {
+		open = open[:i]
+	}
+	if open != strconv.Itoa(out.CrewBest) {
+		t.Fatalf("tail rewrote the arm to %d trace %s", out.CrewBest, out.CTrace)
 	}
 }
 
@@ -510,7 +519,11 @@ func TestCoinbaseReadSurvivesShrink(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		out, err := ExecAuto(env, pool, rfstate.NewLearner(), nil)
+		// Two transactions are below the cold tiny-block cutoff, which would
+		// pin the block at one worker and never reach the higher transaction
+		// while the lower one is parked in BeforeView. A measured arm of 2
+		// is what this race is about: start above 1, then shrink.
+		out, err := ExecAuto(env, pool, rfstate.NewLearner(), preferArm(2))
 		done <- result{out, err}
 	}()
 	select {

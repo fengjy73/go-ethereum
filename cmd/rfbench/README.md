@@ -162,10 +162,20 @@ Blocks are sorted by number. Priors for block N come only from blocks below N.
   used to drift every key to PASS. A single-block command has no earlier
   block, so the prior is empty even in `carry` mode.
 
-The P0 rule is greedy: a key is fenced after its first invalidation, and
-`WAIT_FINAL` is chosen when a lower producer exists and the posterior mean
-exceeds 1/2. The cold prior is Beta(1, 32). Nothing is injected from a
-global hot set.
+A key is fenced after its first invalidation. `WAIT_FINAL` is chosen only
+when a lower producer exists and the expected wait is strictly shorter
+than the expected re-execution it avoids:
+
+```
+E[wait] < P(conflict) * E[re-exec]
+```
+
+Until both sides have a nanosecond estimate the choice is PASS. The wait
+estimate is the measured park time after four samples, otherwise half the
+successful producer's attempt. The re-execution estimate is the wall time
+of an attempt that a write of that key invalidated. The cold prior is
+Beta(1, 32) with no durations, so it cannot satisfy the inequality.
+Nothing is injected from a global hot set.
 
 ### Learned worker count (`rf-auto`)
 
@@ -179,69 +189,82 @@ changes, and `ExecAuto` restores the cap before it returns. A deferred
 update carries the `Drive` generation and is ignored once the next block
 has started.
 
-The count minimises
+The count is one arm for the whole body, drawn from a geometric grid
+inside the cap: powers of two, plus the cap when it is not a power of
+two. Speedup and overhead are multiplicative. Sampling every integer
+treated the gaps as signal; on a 32-wide cap that visited 6..31 and the
+per-segment inflation model (unmeasured C stored as infl=1, which is as
+cheap as C=1, plus a lower-confidence bonus) ended every trace at 1.
 
-```
-T(C) = fixedNs*infl(C) + nTx*txFixed*infl(C) + max(CP, Work/C)*(1+r(C))*base*infl(C)
-```
-
-over every integer `C` from 1 to the smoothed frontier, capped by the
-process limit. Until `base` is known, `T` is the gas-equivalent
-`max(CP, Work/C)*(1+r)` and `model_pred_ns` is 0.
-
-`CP` is the longest chain still ahead of the frontier. Same-sender edges
-come from the nonce order. A contract with cross-sender read-after-write
-adds a soft chain: its heaviest transaction plus
-`conflicts / (seen + 8)` times the rest of its weight, after at least four
-transactions and only when that rate exceeds 0.25. Unseen contracts add
-nothing, and the rate does not turn the whole contract into one sender chain.
-`Work` is the sum of per-transaction weights. A weight is the selector's
-observed mean gas shrunk toward the gas-limit prior,
-`(4*prior + n*mean) / (4+n)`, else the gas limit times the learned
-actual-to-limit ratio. One observation does not replace the limit.
-`r(C)` is the learned re-execution rate. `base` is process CPU nanoseconds
-per gas at C=1. `infl(C)` is CPU-per-gas at that C divided by `base`,
-clamped to `[0.25, 8]`. It is not `rate(C)/rate(1)`: that ratio mixes a
-parallelism mistake into the slowdown. `fixedNs` and `txFixed` are the
-C=1 wall that `base*gas` does not explain, plus time outside the segments.
-
-Each time the active count changes, the wall, CPU, and gas of the segment
-that just ended are attributed to the C that was actually running. An
-abandoned probe updates `rate(C)` and `infl(C)` for that probe. A tail
-segment, and a body segment whose frontier width was below C, do not move
-`rate(C)`. The narrow body segment still takes a fractional sample so the
-next block does not open the same unmeasured probe. A short segment
-(under 200k gas) moves the EMA by `gas/(gas+500k)` and adds 0.25 of a
-sample; a longer one adds a full sample.
-
-The opening choice minimises `T(C) * (1 - 0.35/sqrt(samples(C)+1))`.
-Unmeasured C stay eligible, so the first block's choice cannot be the only
-C that is ever sampled. That opening value is the one exploration for the
-block. It is held until the first completion checkpoint even if the width
-EWMA dips, unless the live frontier drops below C, in which case the
-segment is closed and the count drops. The checkpoint folds the segment
-into the model and re-picks by the posterior mean, staying on the
-incumbent unless another C is more than 5% better. Checkpoints are
-completions `n/4`, `n/2`, and `3n/4` when `n >= 8`, or `n/2` when
-`2 <= n < 8`. The frontier width is an EWMA with alpha 0.25. The integer
-cap moves only when the average is a full worker away from the cap. When
+The reward is the body's wall nanoseconds per gas. The tail, entered when
 more than two transactions remain in the block and at most two are left
-ahead of the frontier, the active count may shrink. That tail does not
-change `CrewBest` and is not a rate sample.
+ahead of the frontier, is not part of the reward. A guard that shrinks
+the active count does not move the reward onto the shrunk count and does
+not change `CrewBest`.
 
-If `base` was seeded from a C other than 1, the next block's one explore
-is C=1 so inflation can be rescaled onto the serial clock.
+Each arm keeps a Welford mean. The prior pseudo-count is 1. An untried
+arm's mean is `ref * priorRatio(C)`. `ref` is the C=1 nanoseconds per gas,
+or 1 when nothing has been measured. On a block that can fill the arm,
+`priorRatio(C) = 1 + 0.06*log2(C)^2` (1 at C=1, about 1.06 at C=2, 1.24 at
+C=4, 2.5 at C=32). A plain `(1+log2(C))/sqrt(C)` is 1.5 at C=4, so one
+sample of the ~1.4x speedup these blocks actually show cannot beat it,
+and it is only ~1.06 at C=32, so Thompson noise draws that rung as often
+as a neighbor. The quadratic log stays above the serial rate everywhere,
+lets one 1.4x sample adopt C=4, and keeps an untried C=32 rare. If the
+structural speedup cannot fill the arm, `(1+log2(C))/sqrt(speedup)`
+replaces the quadratic when it is higher, so a sender chain does not
+explore. `speedup` is work/CP from the structural model, capped by the
+process limit, and is only this prior feature. With no samples the draw
+is the prior mean and no noise, so the first block is C=1 rather than
+the cap. After that, each block draws once from
+Normal(posterior mean, variance of the mean) and takes the minimum.
+Clones of the same pre-block model share the seed, so the K runs of one
+block pick the same arm.
+
+Arms above the opening frontier width are not eligible. A single-sender
+chain therefore cannot be assigned a wide arm.
+
+In-block changes are guards only. The frontier width is an EWMA with
+alpha 0.25; the integer cap moves when the average is a full worker away,
+and if that cap falls below the active count the active count follows it
+down and does not climb back. An abort storm (at least eight completions
+and more rollbacks than completions) or sustained idle (idle time above
+elapsed*(active-1) after four completions) halves the active count, again
+without climbing back and without changing the arm.
+
+A block that is too small to pay for parallel startup runs at C=1 for
+the whole block and uses the solo path. Before a serial rate exists that
+is fewer than 48 transactions. Afterwards it is
+`gas * serialRate < 2 * startupNs`, where `startupNs` starts at 2.5ms and
+is an EMA of the wall a wider arm spent above the serial rate, capped at
+half that wall. Solo is safe only because the active count never grows.
+A block that opens above 1 stays off the solo path when a guard later
+drops it to 1.
+
+Ten blocks do not support a separate posterior per conflict class or
+transaction-count bucket: the arms would starve. The only split the
+measurements support is tiny versus the rest, and that split is the
+startup rule above rather than a second bandit.
+
+`CP` and `Work` are not the score. They only set `speedup`. `CP` is the
+longest same-sender chain, extended by a soft cross-sender RAW chain on
+a hot contract: its heaviest transaction plus `conflicts / (seen + 8)`
+times the rest of its weight, after at least four transactions and only
+when that rate exceeds 0.25. `Work` is the sum of per-transaction weights.
+A weight is the selector's observed mean gas shrunk toward the gas-limit
+prior, `(4*prior + n*mean) / (4+n)`, else the gas limit times the learned
+actual-to-limit ratio. One observation does not replace the limit.
 
 `-prior reset` clears only the per-key Beta learner. The cost model is
 carried across blocks either way. Each of the K runs clones the pre-block
 model. After the block the model is the last run's.
 
-`model_c` is the body choice at the end of the run (the opening choice,
-unless a checkpoint abandoned it). `model_pred_ns` is the opening
-full-block `T` for that C in nanoseconds, or 0 when the opening plan had
-no `base` yet. It is not refit to this block's wall. `model_curve` is
-`ns:` or `gas:` followed by `c=v` pairs for that same opening plan, so
-`model_pred_ns` is the pair for `model_c` when that C was scored up front.
+`model_c` is the arm chosen for the body. `model_pred_ns` is that arm's
+opening posterior mean times the estimated gas, in nanoseconds, or 0 when
+the opening plan had no measured rate. It is not refit to this block's
+wall. `model_curve` is `ns:` or `gas:` followed by `c=v` pairs for the
+grid arms in that same opening plan, so `model_pred_ns` is the pair for
+`model_c` when the unit is `ns`.
 
 Early publication of a storage slot or nonce runs only when the block is
 not statically single-worker and the key is fenced with more single-write
@@ -292,7 +315,7 @@ the serial oracle. A mismatch exits non-zero.
 | coinbase fee recorded per transaction; prefix wait only on a real balance read | `addCoinbaseFee`, `Ledger.RecordFee`, `Fold` |
 | per-key Beta, greedy P0 rule | `core/rfstate/learner.go` |
 | fixed C, pool can change C, pinned persistent workers | `core/rfstate/pool.go` |
-| learned C, list-scheduling cost model, proc gate | `core/rfexec/crew.go`, `core/rfexec/proc.go`, `ExecAuto` |
+| learned C, Thompson arms and shrink guards, proc gate | `core/rfexec/crew.go`, `core/rfexec/proc.go`, `ExecAuto` |
 | pin active workers onto the fewest last-level caches | `core/rfstate/topology.go` |
 | early publish of a single-write hot key when C>1 | `TxView.SetState`, `TxView.SetNonce` |
 | frontier termination (no lone tail) | `sched.tryAdvanceLocked`, `Pool` stays until `Done` |
@@ -307,24 +330,26 @@ nonce or estimate miss parks on the lower transaction.
 
 ## Known gaps versus design section 6
 
-- Greedy threshold instead of Thompson sampling.
+- Per-key fence costs are measured waits and re-executions, not a second Thompson sampler. The worker-count policy is the Thompson sampler.
 - No `FIN_LASTW`. Early publish covers a fenced key whose attempts usually
   wrote it once, and only while more than one worker is active. A second
   write of that key still invalidates readers of the previous bytes.
   Abandoned attempts retract the early version; there is no separate
   cascade for values derived from it beyond that invalidation.
 - No ORDER hand-off.
-- Learned C is the list-scheduling model above: critical path (including
-  a hot-contract RAW chain), work, a C=1 baseline, a per-C CPU inflation,
-  a fixed overhead, and a re-execution rate. It is not a per-transaction
-  simulator. Tail drain does not become the next block's prior. The first
-  block of a process has no baseline, so its `model_pred_ns` is 0.
+- Learned C is one Thompson arm per block on the geometric grid above.
+  The critical path is only a prior feature. There is no per-C inflation
+  or fixed-cost regression on the decision path. Tail drain does not
+  become the next block's prior. The first block of a process has no
+  measured rate, so its `model_pred_ns` is 0 and its arm is 1.
 - Rollback restarts the transaction and fast-forwards by read sequence.
   Fast-forward skips waits; it still re-registers readers. Interpreter
   frames are not restored from the snapshot.
 - Decay is a fixed prior-weight fade (33/34 per block), not a fitted
   empirical-Bayes model. Conflict counts are not decayed.
-- Replay cost and wait cost are both 1.
+- A fence is PASS until both the wait and the re-execution have a
+  nanosecond estimate, and PASS again when the measured wait is not
+  strictly cheaper than the conflict probability times the re-execution.
 - OCC parks on a nonce producer instead of retrying immediately, so it is
   not a byte-for-byte Block-STM loop. The change is there to avoid the
   known livelock.

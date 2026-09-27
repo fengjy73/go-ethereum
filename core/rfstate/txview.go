@@ -344,9 +344,7 @@ func (v *TxView) fence(k Key, seq int) {
 		}
 		return
 	}
-	// A key with no conflict evidence has posterior mean 1/33, so the greedy
-	// rule is PASS whether or not a lower producer exists. Skip the second
-	// key lock and the learner map.
+	// A key with no conflict evidence is PASS. Skip the second key lock.
 	if v.learner == nil || v.ledger == nil {
 		return
 	}
@@ -362,7 +360,7 @@ func (v *TxView) fence(k Key, seq int) {
 		return
 	}
 	if v.deps != nil && !v.deps.TxSettled(prod) {
-		panic(Signal{Kind: SigWaitFinal, Depend: prod, Seq: seq})
+		panic(Signal{Kind: SigWaitFinal, Depend: prod, Seq: seq, Key: k})
 	}
 }
 

@@ -19,7 +19,7 @@ package rfexec
 import (
 	"encoding/binary"
 	"math"
-	"sort"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
@@ -31,10 +31,6 @@ import (
 )
 
 const (
-	// ucbBeta is the minimisation bonus. lcb = T * (1 - beta/sqrt(samples+1)).
-	// Unmeasured C keep the full bonus, so a cold first block cannot be the
-	// only C that ever receives a sample.
-	ucbBeta = 0.35
 	// selShrink pulls a selector estimate toward the gas-limit prior.
 	// One observation does not replace the limit.
 	selShrink = 4.0
@@ -43,29 +39,22 @@ const (
 	hotShrink  = 8.0
 	hotMinSeen = 4.0
 	hotRateMin = 0.25
-	// rateGasFull is enough executed gas to count as one rate sample.
-	// Shorter segments still move the EMA and add a fractional sample.
-	rateGasFull  = 200_000
-	rateGasBlend = 500_000
-	// baseGasMin is the gas a C=1 segment needs before it may move the
-	// nanoseconds-per-gas baseline. Smaller C=1 segments still teach the
-	// fixed overhead.
-	baseGasMin = 500_000
+	// armPriorN is the pseudo-count on an untried worker count.
+	// One real sample can overturn the prior; two would not, for a
+	// four-times-faster rung.
+	armPriorN = 1.0
+	// armPriorStd is the untried arm's standard deviation, as a fraction
+	// of its prior mean. Nearby rungs are drawn sometimes. A wide rung
+	// whose prior mean sits well above C=1 is rarely drawn.
+	armPriorStd = 0.25
+	// minArmGas ignores a body too small to be a rate.
+	minArmGas = 50_000
+	// tinyTxCold is the bootstrap for "this block cannot pay for parallel
+	// startup". It is replaced once a serial nanoseconds-per-gas rate exists.
+	tinyTxCold = 48
+	// startupInit is the bootstrap parallel-startup estimate, in nanoseconds.
+	startupInit = 2.5e6
 )
-
-// Segment is one stretch of a block executed at a single active worker
-// count. Tail segments, and body segments whose frontier was narrower
-// than C, do not update that C's rate or inflation.
-type Segment struct {
-	C      int
-	WallNs uint64
-	CPUNs  uint64
-	Gas    uint64
-	Execs  uint64
-	Rolls  uint64
-	Width  int
-	Tail   bool
-}
 
 type selStat struct {
 	gas float64
@@ -77,36 +66,44 @@ type hotStat struct {
 	seen      float64
 }
 
+// armStat is one worker-count's wall-nanoseconds-per-gas, as a Welford
+// mean. The decision does not fit per-C inflation, a baseline, or a
+// fixed cost. Those regressions treated an unmeasured C as infl=1, which
+// is as cheap as C=1, and then visited every integer up to the cap.
+type armStat struct {
+	n, mean, m2 float64
+}
+
 // CostPrior is the cross-block worker-count model. It is not the per-key
 // Beta learner. -prior reset clears the Beta learner and does not clear
 // this model.
 //
-//	T(C) = fixedNs*infl(C) + nTx*txFixed*infl(C) + max(CP, Work/C)*(1+r(C))*base*infl(C)
+// Each block runs one arm for its body. The arm set is a geometric grid
+// inside the cap: powers of two, plus the cap when it is not a power of
+// two. Speedup and overhead are multiplicative, and on ict21 the integer
+// curve was saw-toothed noise (one block's T(1..7) was 141/199/63/70/44/28/57),
+// so the integers between rungs are not arms.
 //
-// CP is the longest same-sender chain, extended by cross-sender RAW on a
-// hot contract. Work is selector gas shrunk toward the gas limit, else the
-// gas limit times util. base is nanoseconds per gas at C=1, from process
-// CPU. infl(C) is CPU-per-gas at C divided by base, not a ratio of wall
-// rates. Until base is known, T is in gas-equivalents and model_pred_ns is 0.
+// The reward is the body's wall time per gas. Tail drain is excluded.
+// A guard that shrinks the active count does not move the reward onto
+// the shrunk count: the whole body is charged to the arm that was chosen,
+// so an arm that could not stay wide looks slow.
+//
+// The structural critical path is only a prior feature. An untried arm's
+// mean is ref * priorRatio, which is above the serial rate. With no
+// samples the draw is that mean with no noise, so the first block is C=1.
 type CostPrior struct {
-	Chosen  int
-	meanGas float64
-	infl    map[int]float64
-	reexec  map[int]float64
-	samples map[int]float64
-	sel     map[selKey]selStat
-	// rate is wall nanoseconds per actual gas at that C. It records what
-	// ran. The score uses base and infl, not this rate, so a parallelism
-	// mistake is not baked into the slowdown.
-	rate    map[int]float64
-	util    float64
-	base    float64
-	txFixed float64
-	fixedNs float64
-	// refC is the worker count base was seeded from. A later C=1 sample
-	// replaces it and rescales infl.
-	refC int
-	hot  map[common.Address]hotStat
+	Chosen     int
+	arms       map[int]armStat
+	sel        map[selKey]selStat
+	hot        map[common.Address]hotStat
+	util       float64
+	meanGas    float64
+	serialRate float64
+	startupNs  float64
+	// step selects the Thompson seed. Clones copy it, so K runs of one
+	// block draw the same arm. The run that is kept has stepped once.
+	step uint64
 }
 
 type selKey struct {
@@ -114,16 +111,14 @@ type selKey struct {
 	sel uint32
 }
 
-// NewCostPrior is a cold model. Inflation is 1 until a segment measures
-// it. The first block therefore follows the structural argmin.
+// NewCostPrior is a cold model. No arm has a sample, so the first block
+// follows the prior mean and starts at one worker.
 func NewCostPrior() *CostPrior {
 	return &CostPrior{
-		infl:    map[int]float64{},
-		reexec:  map[int]float64{},
-		samples: map[int]float64{},
-		sel:     map[selKey]selStat{},
-		rate:    map[int]float64{},
-		hot:     map[common.Address]hotStat{},
+		arms:      map[int]armStat{},
+		sel:       map[selKey]selStat{},
+		hot:       map[common.Address]hotStat{},
+		startupNs: startupInit,
 	}
 }
 
@@ -133,26 +128,16 @@ func (c *CostPrior) Clone() *CostPrior {
 	}
 	out := NewCostPrior()
 	out.Chosen = c.Chosen
-	out.meanGas = c.meanGas
 	out.util = c.util
-	out.base = c.base
-	out.txFixed = c.txFixed
-	out.fixedNs = c.fixedNs
-	out.refC = c.refC
-	for k, v := range c.infl {
-		out.infl[k] = v
-	}
-	for k, v := range c.reexec {
-		out.reexec[k] = v
-	}
-	for k, v := range c.samples {
-		out.samples[k] = v
+	out.meanGas = c.meanGas
+	out.serialRate = c.serialRate
+	out.startupNs = c.startupNs
+	out.step = c.step
+	for k, v := range c.arms {
+		out.arms[k] = v
 	}
 	for k, v := range c.sel {
 		out.sel[k] = v
-	}
-	for k, v := range c.rate {
-		out.rate[k] = v
 	}
 	for k, v := range c.hot {
 		out.hot[k] = v
@@ -160,34 +145,200 @@ func (c *CostPrior) Clone() *CostPrior {
 	return out
 }
 
-func (c *CostPrior) inflation(n int) float64 {
-	if c == nil || n < 1 {
+// armGrid is the worker counts a block may be assigned. Powers of two,
+// then the cap if it is not already on that ladder.
+func armGrid(cap int) []int {
+	if cap < 1 {
+		cap = 1
+	}
+	var arms []int
+	for n := 1; n < cap; n *= 2 {
+		arms = append(arms, n)
+	}
+	if len(arms) == 0 || arms[len(arms)-1] != cap {
+		arms = append(arms, cap)
+	}
+	return arms
+}
+
+// priorRatio is how much more expensive an untried arm looks, per gas,
+// than the serial rate. It has to clear two constraints at once.
+//
+// A fully parallel pen/gain of (1+log2(C))/sqrt(C) is 1.5 at C=4 and only
+// about 1.06 at C=32. The C=32 value is not pessimistic: Thompson noise
+// draws it as often as a neighbor, which is how every integer up to the
+// cap got visited when the old model stored infl=1. The C=4 value is too
+// pessimistic for the speedups these blocks actually have (about 1.4x, not
+// 4x): one such sample cannot pull a 1.5x prior under the serial rate.
+//
+// The parallel prior is therefore 1+0.06*log2(C)^2: C=2 ≈ 1.06, C=4 ≈ 1.24
+// (one 1.4x sample wins), C=32 = 2.5 (rarely drawn). When the structural
+// speedup cannot fill the arm, the older pen/gain ratio replaces it if
+// that ratio is higher, so a sender chain does not explore wide arms.
+func priorRatio(arm int, speedup float64) float64 {
+	if arm <= 1 {
 		return 1
 	}
-	if c.refC == n {
+	lg := math.Log2(float64(arm))
+	ratio := 1 + 0.06*lg*lg
+	if speedup < 1 {
+		speedup = 1
+	}
+	if speedup < float64(arm) {
+		gain := math.Sqrt(speedup)
+		if gain < 1 {
+			gain = 1
+		}
+		structural := (1 + lg) / gain
+		if structural > ratio {
+			ratio = structural
+		}
+	}
+	return ratio
+}
+
+func (c *CostPrior) anySample() bool {
+	if c == nil {
+		return false
+	}
+	for _, st := range c.arms {
+		if st.n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// refRate is nanoseconds per gas from C=1, else from the smallest sampled
+// arm, else 1 when nothing has been measured (the curve is then unitless
+// and model_pred_ns stays 0).
+func (c *CostPrior) refRate() float64 {
+	if c == nil {
 		return 1
 	}
-	if v, ok := c.infl[n]; ok && v > 0 {
-		return v
+	if c.serialRate > 0 {
+		return c.serialRate
 	}
-	// No nearest-neighbor copy. A short or contended sample at C=2
-	// used to clamp infl to 8 and then paint C=4 with the same number,
-	// so later parallel blocks never left 1.
+	best := 0
+	for arm, st := range c.arms {
+		if st.n > 0 && st.mean > 0 && (best == 0 || arm < best) {
+			best = arm
+		}
+	}
+	if best > 0 {
+		return c.arms[best].mean
+	}
 	return 1
 }
 
-func (c *CostPrior) reexecRate(n int) float64 {
-	if c == nil {
-		return 0
+func (c *CostPrior) posterior(arm int, ref, speedup float64) (mean, std float64) {
+	if ref <= 0 {
+		ref = 1
 	}
-	if v, ok := c.reexec[n]; ok && v > 0 {
-		return v
+	mean0 := ref * priorRatio(arm, speedup)
+	st := armStat{}
+	if c != nil {
+		st = c.arms[arm]
 	}
-	return 0
+	n := st.n
+	mean = (armPriorN*mean0 + n*st.mean) / (armPriorN + n)
+	priorVar := (armPriorStd * mean0) * (armPriorStd * mean0)
+	std = math.Sqrt((armPriorN*priorVar + st.m2) / ((armPriorN + n) * (armPriorN + n)))
+	return mean, std
 }
 
-// conflictProb is the shrunk cross-sender RAW rate for a contract.
-// Below hotMinSeen observations it is zero, so a cold contract stays parallel.
+// pick minimises a Thompson draw once any arm has a sample. With no
+// samples it minimises the prior mean, so a cold model does not open at
+// the cap. Equal draws keep the smaller arm.
+func (c *CostPrior) pick(arms []int, ref, speedup float64) int {
+	if c == nil || len(arms) == 0 {
+		return 1
+	}
+	var rng *rand.Rand
+	if c.anySample() {
+		c.step++
+		rng = rand.New(rand.NewPCG(1, c.step))
+	}
+	best := arms[0]
+	bestV := math.MaxFloat64
+	for _, a := range arms {
+		if a < 1 {
+			continue
+		}
+		mean, std := c.posterior(a, ref, speedup)
+		v := mean
+		if rng != nil && std > 0 {
+			v = mean + std*rng.NormFloat64()
+			if v < 0 {
+				v = 0
+			}
+		}
+		if v < bestV {
+			bestV = v
+			best = a
+		}
+	}
+	if best < 1 {
+		best = 1
+	}
+	c.Chosen = best
+	return best
+}
+
+// tooSmall reports that parallel startup is not worth paying. Before a
+// serial rate exists, fewer than tinyTxCold transactions is the stand-in
+// (the 27-transaction block whose best fixed C is 1). Afterwards the
+// comparison is learned: gas * serialRate < 2 * startupNs.
+func (c *CostPrior) tooSmall(nTx int, gas float64) bool {
+	if c != nil && c.serialRate > 0 && gas > 0 {
+		startup := c.startupNs
+		if startup < 0 {
+			startup = 0
+		}
+		return gas*c.serialRate < 2*startup
+	}
+	return nTx > 0 && nTx < tinyTxCold
+}
+
+// ObserveArm records one body's wall per gas on the arm that was chosen
+// for that body. gas below minArmGas is ignored. A C=1 sample replaces
+// the serial rate. A wider sample updates the startup estimate from the
+// wall that the serial rate does not explain, capped at half the wall so
+// one slow block cannot swallow the threshold.
+func (c *CostPrior) ObserveArm(arm int, wallNs, gas uint64) {
+	if c == nil || arm < 1 || wallNs == 0 || gas < minArmGas {
+		return
+	}
+	if c.arms == nil {
+		c.arms = map[int]armStat{}
+	}
+	rate := float64(wallNs) / float64(gas)
+	st := c.arms[arm]
+	st.n++
+	d := rate - st.mean
+	st.mean += d / st.n
+	st.m2 += d * (rate - st.mean)
+	c.arms[arm] = st
+	if arm == 1 {
+		c.serialRate = st.mean
+	}
+	if arm > 1 && c.serialRate > 0 {
+		excess := float64(wallNs) - c.serialRate*float64(gas)
+		if excess < 0 {
+			excess = 0
+		}
+		if excess > float64(wallNs)*0.5 {
+			excess = float64(wallNs) * 0.5
+		}
+		if c.startupNs <= 0 {
+			c.startupNs = excess
+		} else {
+			c.startupNs = c.startupNs*0.8 + excess*0.2
+		}
+	}
+	c.Chosen = arm
+}
+
 func (c *CostPrior) conflictProb(addr common.Address) float64 {
 	if c == nil {
 		return 0
@@ -224,128 +375,6 @@ func (c *CostPrior) noteContract(addr common.Address, conflict bool) {
 	c.hot[addr] = st
 }
 
-// ObserveSegments updates rate, inflation, and the C=1 overhead from each
-// body segment. A tail segment is ignored. A body segment whose frontier
-// width was below C does not move rate(C); it only records a fractional
-// sample so the same probe is not opened every block.
-func (c *CostPrior) ObserveSegments(segs []Segment) {
-	if c == nil {
-		return
-	}
-	for _, seg := range segs {
-		c.observeSegment(seg)
-	}
-}
-
-func (c *CostPrior) observeSegment(seg Segment) {
-	if seg.C < 1 || seg.Gas == 0 || seg.WallNs == 0 || seg.Tail {
-		return
-	}
-	if seg.Width > 0 && seg.Width < seg.C {
-		c.samples[seg.C] += 0.25
-		return
-	}
-	sample := float64(seg.WallNs) / float64(seg.Gas)
-	alpha := float64(seg.Gas) / (float64(seg.Gas) + rateGasBlend)
-	if prev := c.rate[seg.C]; prev > 0 {
-		c.rate[seg.C] = prev*(1-alpha) + sample*alpha
-	} else {
-		c.rate[seg.C] = sample
-	}
-	if seg.Gas >= rateGasFull {
-		c.samples[seg.C] += 1
-	} else {
-		c.samples[seg.C] += 0.25
-	}
-	if seg.Execs > 0 {
-		r := float64(seg.Rolls) / float64(seg.Execs)
-		c.reexec[seg.C] = ema(c.reexec[seg.C], r, 0.25)
-		c.meanGas = ema(c.meanGas, float64(seg.Gas)/float64(seg.Execs), 0.25)
-	}
-	c.learnScale(seg)
-	c.Chosen = seg.C
-}
-
-func (c *CostPrior) learnScale(seg Segment) {
-	if seg.CPUNs == 0 || seg.Gas == 0 {
-		return
-	}
-	per := float64(seg.CPUNs) / float64(seg.Gas)
-	// Short segments still update rate above. They must not seed the
-	// baseline or the per-C inflation: a drain's CPU/gas is overhead.
-	if seg.Gas < baseGasMin {
-		return
-	}
-	if seg.Execs > 0 && seg.Rolls > seg.Execs/4 {
-		return
-	}
-	if c.base <= 0 {
-		c.base = per
-		c.refC = seg.C
-	}
-	if seg.C == 1 {
-		if per > 0 {
-			if c.refC != 1 && c.base > 0 {
-				scale := c.base / per
-				for k, v := range c.infl {
-					c.infl[k] = v * scale
-				}
-			}
-			if c.refC != 1 {
-				c.base = per
-			} else if per < c.base {
-				c.base = c.base*0.5 + per*0.5
-			} else {
-				c.base = c.base*0.9 + per*0.1
-			}
-			c.refC = 1
-		}
-		if c.refC == 1 && c.base > 0 {
-			c.learnOverhead(seg)
-		}
-		return
-	}
-	if c.base <= 0 || seg.C == c.refC {
-		return
-	}
-	inf := per / c.base
-	if inf < 0.25 {
-		inf = 0.25
-	}
-	if inf > 8 {
-		inf = 8
-	}
-	if prev := c.infl[seg.C]; prev > 0 {
-		c.infl[seg.C] = prev*0.75 + inf*0.25
-	} else {
-		c.infl[seg.C] = inf
-	}
-}
-
-func (c *CostPrior) learnOverhead(seg Segment) {
-	extra := float64(seg.WallNs) - c.base*float64(seg.Gas)
-	if extra < 0 {
-		extra = 0
-	}
-	n := float64(seg.Execs)
-	if n < 1 {
-		n = 1
-	}
-	fixedGuess := extra * (8 / (n + 8))
-	perTx := (extra - fixedGuess) / n
-	c.fixedNs = ema(c.fixedNs, fixedGuess, 0.25)
-	c.txFixed = ema(c.txFixed, perTx, 0.25)
-}
-
-// NoteRemainder folds wall time outside the accounted segments (pre-state,
-// post-state, withdrawals) into the fixed per-block cost.
-func (c *CostPrior) NoteRemainder(ns uint64) {
-	if c == nil || ns == 0 {
-		return
-	}
-	c.fixedNs = ema(c.fixedNs, float64(ns), 0.25)
-}
-
 // NoteUtil records actual gas divided by the sum of gas limits.
 func (c *CostPrior) NoteUtil(gas, limitSum float64) {
 	if c == nil || gas <= 0 || limitSum <= 0 {
@@ -361,26 +390,6 @@ func (c *CostPrior) NoteUtil(gas, limitSum float64) {
 	c.util = ema(c.util, u, 0.25)
 }
 
-// ObserveBlock records one non-tail segment whose CPU time is the wall.
-// Tests and a single-C block use it. Production auto runs call
-// ObserveSegments with the per-segment CPU sample.
-func (c *CostPrior) ObserveBlock(chosen int, wallNs, gas, execs, rolls uint64, predGas, limitSum float64) {
-	if c == nil || chosen < 1 || wallNs == 0 || gas == 0 {
-		return
-	}
-	_ = predGas
-	c.ObserveSegments([]Segment{{
-		C:      chosen,
-		WallNs: wallNs,
-		CPUNs:  wallNs,
-		Gas:    gas,
-		Execs:  execs,
-		Rolls:  rolls,
-		Width:  chosen,
-	}})
-	c.NoteUtil(float64(gas), limitSum)
-}
-
 func ema(prev, sample, alpha float64) float64 {
 	if prev <= 0 || alpha >= 1 {
 		return sample
@@ -393,58 +402,42 @@ func ema(prev, sample, alpha float64) float64 {
 
 // crew plans the active worker count for one block.
 //
-// The opening choice minimises a lower confidence bound over every integer
-// C in range, so an unmeasured rung stays eligible. That is the one
-// exploration for the block. Checkpoints re-pick by the posterior mean
-// after the opening segment has been folded in, and abandon a bad probe.
-// The frontier width is an EWMA. The integer cap moves only when the
-// average is a full worker away from the cap. Tail drain may lower the
-// active count once two or fewer transactions remain. It does not change
-// Best, and its segment is not a rate sample.
+// begin picks one arm and that arm is Best for the whole block. observe
+// only shrinks: smoothed frontier below the active count, the last two
+// transactions, an abort storm, or sustained idle. None of those rewrite
+// Best or attribute the body to a different arm. A block whose opening
+// arm is 1 never grows, so the scheduler may take the solo path.
 type crew struct {
-	cost       *CostPrior
-	limit      int
-	n          int
-	txs        []*types.Transaction
-	prev       []int
-	senders    []common.Address
-	weight     []float64
-	active     int
-	bestC      int
-	predG      map[int]float64
-	bodyG      float64
-	startG     float64
-	frontier   int
-	widthE     float64
-	widthC     int
-	liveWidth  int
-	finals     int
-	limitSum   float64
-	startScore map[int]float64
-	startNS    bool
-	nextAt     int
-	checks     []int
-	tail       bool
-	probing    bool
-	rolls      uint64
-	execs      uint64
-	trace      []int
+	cost      *CostPrior
+	limit     int
+	n         int
+	txs       []*types.Transaction
+	prev      []int
+	senders   []common.Address
+	weight    []float64
+	active    int
+	bestC     int
+	bodyGas   uint64
+	frontier  int
+	widthE    float64
+	widthC    int
+	liveWidth int
+	finals    int
+	limitSum  float64
+	tail      bool
+	noClimb   bool
+	rewarded  bool
+	rolls     uint64
+	execs     uint64
+	trace     []int
 
 	clock    func() (time.Time, int64)
-	open     *openSeg
-	segments []Segment
-	writers  map[rfstate.Key]int
-}
+	bodyAt   time.Time
+	planUnit string
+	planPred int64
+	planText string
 
-type openSeg struct {
-	c        int
-	start    time.Time
-	cpu0     int64
-	gas      uint64
-	execs    uint64
-	rolls0   uint64
-	widthMin int
-	tail     bool
+	writers map[rfstate.Key]int
 }
 
 func newCrew(cost *CostPrior, limit int, env *BlockEnv) *crew {
@@ -462,7 +455,6 @@ func newCrew(cost *CostPrior, limit int, env *BlockEnv) *crew {
 		cost:   cost,
 		limit:  limit,
 		n:      n,
-		predG:  map[int]float64{},
 		weight: make([]float64, n),
 	}
 	if env != nil {
@@ -470,25 +462,14 @@ func newCrew(cost *CostPrior, limit int, env *BlockEnv) *crew {
 		c.prev = env.PrevSame
 		c.senders = env.Senders
 	}
-	if n >= 8 {
-		for _, p := range []int{n / 4, n / 2, (3 * n) / 4} {
-			if p > 0 && (len(c.checks) == 0 || c.checks[len(c.checks)-1] != p) {
-				c.checks = append(c.checks, p)
-			}
-		}
-	} else if n >= 2 {
-		c.checks = []int{n / 2}
-		if c.checks[0] < 1 {
-			c.checks[0] = 1
-		}
-	}
 	return c
 }
 
 func (c *crew) setClock(fn func() (time.Time, int64)) { c.clock = fn }
 
-// begin seeds weights, picks the first C, and returns it. width is the
-// current structural frontier.
+// begin seeds weights, picks the arm, and returns it. width is the
+// opening structural frontier. Arms above that width are not eligible:
+// a single-sender chain has nothing for them to run.
 func (c *crew) begin(width int) int {
 	c.seedWeights()
 	if width < 1 {
@@ -500,42 +481,119 @@ func (c *crew) begin(width int) int {
 	if c.widthC > c.limit {
 		c.widthC = c.limit
 	}
-	c.active = c.choose(true, true)
-	c.bestC = c.active
-	c.bodyG = c.predG[c.active]
-	c.startG = c.bodyG
-	c.startNS = c.cost != nil && c.cost.base > 0
-	c.startScore = make(map[int]float64, len(c.predG)+1)
-	nTx := c.n
-	if nTx < 1 {
-		nTx = 1
+	gasEst := c.workEstimate()
+	cp, work := c.path(0)
+	speedup := 1.0
+	if cp > 0 && work > cp {
+		speedup = work / cp
 	}
-	for n, g := range c.predG {
-		if n >= 1 && n <= c.limit && g > 0 {
-			c.startScore[n] = c.score(n, g, nTx)
+	if speedup > float64(c.limit) {
+		speedup = float64(c.limit)
+	}
+	ref := 1.0
+	if c.cost != nil {
+		ref = c.cost.refRate()
+	}
+	eligible := c.widthC
+	if eligible < 1 {
+		eligible = 1
+	}
+	picked := 1
+	if c.cost != nil && !c.cost.tooSmall(c.n, gasEst) {
+		picked = c.cost.pick(armGrid(eligible), ref, speedup)
+	}
+	if picked > eligible {
+		picked = eligible
+	}
+	if picked < 1 {
+		picked = 1
+	}
+	c.active = picked
+	c.bestC = picked
+	c.trace = []int{picked}
+	c.snapshotPlan(picked, ref, speedup, gasEst)
+	return picked
+}
+
+func (c *crew) snapshotPlan(picked int, ref, speedup, gasEst float64) {
+	arms := armGrid(c.limit)
+	unit := "gas"
+	if c.cost != nil && (c.cost.serialRate > 0 || c.cost.anySample()) {
+		unit = "ns"
+	}
+	var b strings.Builder
+	b.WriteString(unit)
+	b.WriteByte(':')
+	pred := 0.0
+	seen := false
+	for i, a := range arms {
+		mean := ref
+		if c.cost != nil {
+			mean, _ = c.cost.posterior(a, ref, speedup)
+		}
+		v := mean * gasEst
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.Itoa(a))
+		b.WriteByte('=')
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+		if a == picked {
+			pred = v
+			seen = true
 		}
 	}
-	if c.active >= 1 && c.startG > 0 {
-		c.startScore[c.active] = c.score(c.active, c.startG, nTx)
+	if !seen && c.cost != nil {
+		mean, _ := c.cost.posterior(picked, ref, speedup)
+		pred = mean * gasEst
 	}
-	c.trace = []int{c.active}
-	return c.active
+	c.planUnit = unit
+	c.planText = b.String()
+	if unit == "ns" && pred > 0 {
+		c.planPred = int64(pred)
+	}
 }
 
-// startSegment opens the body sample at the moment workers are released.
+// startSegment opens the body clock when workers are released.
 func (c *crew) startSegment() {
-	if c == nil || c.open != nil {
+	if c == nil || !c.bodyAt.IsZero() {
 		return
 	}
-	c.openSeg(c.active, false)
+	if c.clock != nil {
+		c.bodyAt, _ = c.clock()
+		return
+	}
+	c.bodyAt = time.Now()
 }
 
-// closeSegments folds the segment that is still open at the end of the block.
+// closeSegments records the body on its arm if the tail has not already.
 func (c *crew) closeSegments() {
 	if c == nil {
 		return
 	}
-	c.foldOpen()
+	c.rewardBody()
+}
+
+func (c *crew) rewardBody() {
+	if c == nil || c.rewarded {
+		return
+	}
+	c.rewarded = true
+	if c.cost == nil {
+		return
+	}
+	var wall uint64
+	if c.clock != nil && !c.bodyAt.IsZero() {
+		now, _ := c.clock()
+		if d := now.Sub(c.bodyAt); d > 0 {
+			wall = uint64(d)
+		}
+	}
+	arm := c.bestC
+	if arm < 1 {
+		arm = 1
+	}
+	c.cost.ObserveArm(arm, wall, c.bodyGas)
 }
 
 func procCPU() int64 {
@@ -546,10 +604,12 @@ func procCPU() int64 {
 	return usage.Utime.Nano() + usage.Stime.Nano()
 }
 
-// observe folds one scheduler event. done is a successful completion of tx.
-// The returned active count changes at a checkpoint, when the live frontier
-// drops below the active count, or at the tail.
-func (c *crew) observe(tx, frontier, width int, gas uint64, done bool, rolls uint64) (int, bool) {
+// observe applies shrink-only guards. done is a successful completion.
+// The returned count never exceeds the opening arm. Best is unchanged.
+func (c *crew) observe(tx, frontier, width int, gas uint64, done bool, rolls uint64, idleNs int64) (int, bool) {
+	if c == nil {
+		return 1, false
+	}
 	if width < 1 {
 		width = 1
 	}
@@ -557,9 +617,6 @@ func (c *crew) observe(tx, frontier, width int, gas uint64, done bool, rolls uin
 		c.rolls = rolls
 	}
 	c.liveWidth = width
-	if c.open == nil {
-		c.openSeg(c.active, c.tail)
-	}
 	if done {
 		c.execs++
 		c.finals++
@@ -567,78 +624,75 @@ func (c *crew) observe(tx, frontier, width int, gas uint64, done bool, rolls uin
 			c.weight[tx] = float64(gas)
 			c.learnSel(tx, float64(gas))
 		}
-		if c.open != nil && gas > 0 {
-			c.open.gas += gas
-			c.open.execs++
+		if !c.tail && gas > 0 {
+			c.bodyGas += gas
 		}
 	}
-	if c.open != nil && width >= c.open.c && (c.open.widthMin == 0 || width < c.open.widthMin) {
-		c.open.widthMin = width
-	}
 	c.frontier = frontier
-	capChanged := c.smooth(width)
+	c.smooth(width)
 	remaining := c.n - frontier
 	if remaining < 0 {
 		remaining = 0
 	}
 	if !c.tail && c.n > 2 && remaining <= 2 {
-		c.foldOpen()
+		c.rewardBody()
 		c.tail = true
-		c.probing = false
-		n := c.tailActive(width)
-		c.openSeg(n, true)
-		return c.apply(n)
+		c.noClimb = true
+		return c.apply(c.clamp(width))
 	}
 	if c.tail {
-		n := c.tailActive(width)
-		if c.open == nil || !c.open.tail || c.open.c != n {
-			c.foldOpen()
-			c.openSeg(n, true)
-		}
-		return c.apply(n)
+		return c.apply(c.clamp(width))
 	}
-	checkpoint := done && c.nextAt < len(c.checks) && c.finals >= c.checks[c.nextAt]
-	if width < c.active {
-		if checkpoint {
-			for c.nextAt < len(c.checks) && c.finals >= c.checks[c.nextAt] {
-				c.nextAt++
+	if !c.noClimb && c.active > 1 && c.execs >= 8 && c.rolls > c.execs {
+		c.noClimb = true
+		return c.apply(c.half())
+	}
+	if !c.noClimb && c.active > 1 && c.execs >= 4 {
+		if el := c.bodyElapsed(); el > 0 {
+			if idleNs > 0 && float64(idleNs) > float64(el)*(float64(c.active)-1) {
+				c.noClimb = true
+				return c.apply(c.half())
 			}
 		}
-		c.probing = false
-		c.foldOpen()
-		// Clamping to the live frontier is not a new body plan.
-		n := c.choose(false, false)
-		if n > width {
-			n = width
+	}
+	if c.widthC < c.active {
+		c.noClimb = true
+		n := c.widthC
+		if n < 1 {
+			n = 1
 		}
-		c.openSeg(n, false)
-		return c.apply(n)
-	}
-	// Hold the opening explore across an EWMA dip. A live frontier below
-	// C already returned above. The first checkpoint folds this segment
-	// and re-picks by the mean, which abandons a bad probe.
-	if c.probing && !checkpoint {
-		return c.active, false
-	}
-	if checkpoint {
-		for c.nextAt < len(c.checks) && c.finals >= c.checks[c.nextAt] {
-			c.nextAt++
-		}
-	}
-	if checkpoint || (capChanged && c.active > c.widthC) {
-		c.probing = false
-		c.foldOpen()
-		n := c.choose(false, true)
-		c.openSeg(n, false)
 		return c.apply(n)
 	}
 	return c.active, false
 }
 
-func (c *crew) tailActive(width int) int {
+func (c *crew) bodyElapsed() int64 {
+	if c.clock == nil || c.bodyAt.IsZero() {
+		return 0
+	}
+	now, _ := c.clock()
+	d := now.Sub(c.bodyAt)
+	if d <= 0 {
+		return 0
+	}
+	return d.Nanoseconds()
+}
+
+func (c *crew) half() int {
+	n := c.active / 2
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+func (c *crew) clamp(width int) int {
 	n := width
 	if c.widthC < n {
 		n = c.widthC
+	}
+	if c.active > 0 && n > c.active {
+		n = c.active
 	}
 	if n < 1 {
 		n = 1
@@ -646,13 +700,12 @@ func (c *crew) tailActive(width int) int {
 	return n
 }
 
-func (c *crew) smooth(width int) bool {
+func (c *crew) smooth(width int) {
 	if c.widthE == 0 {
 		c.widthE = float64(width)
 	} else {
 		c.widthE += 0.25 * (float64(width) - c.widthE)
 	}
-	prev := c.widthC
 	if c.widthC < 1 {
 		c.widthC = 1
 	}
@@ -664,119 +717,6 @@ func (c *crew) smooth(width int) bool {
 	if c.widthC > c.limit {
 		c.widthC = c.limit
 	}
-	return c.widthC != prev
-}
-
-func (c *crew) choose(explore, commit bool) int {
-	limit := c.widthC
-	if c.limit < limit {
-		limit = c.limit
-	}
-	if limit < 1 {
-		limit = 1
-	}
-	cp, work := c.path(c.frontier)
-	localR := 0.0
-	if c.execs > 0 && c.rolls > 0 {
-		localR = float64(c.rolls) / float64(c.execs)
-	}
-	nTx := c.n - c.frontier
-	if nTx < 1 {
-		nTx = 1
-	}
-	bestMean := 1
-	bestMeanT := math.MaxFloat64
-	bestLCB := 1
-	bestLCBT := math.MaxFloat64
-	g1 := c.predictGas(cp, work, 1, localR)
-	for n := 1; n <= limit; n++ {
-		g := c.predictGas(cp, work, n, localR)
-		c.predG[n] = g
-		t := c.score(n, g, nTx)
-		if t < bestMeanT {
-			bestMeanT = t
-			bestMean = n
-		}
-		// The bonus is only for a C that shortens the critical path.
-		// On a pure sender chain every C has the same gas term, and a
-		// bonus would spend the block at a wider count for no speedup.
-		samples := 0.0
-		if c.cost != nil {
-			samples = c.cost.samples[n]
-		}
-		bonus := 0.0
-		if n == 1 || g < g1 {
-			bonus = ucbBeta / math.Sqrt(samples+1)
-			if bonus > 0.95 {
-				bonus = 0.95
-			}
-		}
-		lcb := t * (1 - bonus)
-		if lcb < bestLCBT {
-			bestLCBT = lcb
-			bestLCB = n
-		}
-	}
-	picked := bestMean
-	if explore {
-		picked = bestLCB
-		// A baseline seeded from C>1 is not the C=1 clock. Spend the one
-		// explore on C=1 so the next block can rescale inflation.
-		if c.cost != nil && c.cost.refC > 1 && c.cost.samples[1] < 1 {
-			picked = 1
-		}
-		c.probing = picked != bestMean
-	} else if c.bestC >= 1 && c.bestC <= limit {
-		g := c.predictGas(cp, work, c.bestC, localR)
-		t := c.score(c.bestC, g, nTx)
-		if t <= bestMeanT*1.05 {
-			picked = c.bestC
-		}
-	}
-	if commit && !c.tail {
-		c.bestC = picked
-		c.bodyG = c.predictGas(cp, work, picked, localR)
-	}
-	return picked
-}
-
-// score is nanoseconds when base is known, otherwise the gas-equivalent.
-func (c *crew) score(n int, gas float64, nTx int) float64 {
-	if gas <= 0 {
-		gas = c.predG[n]
-	}
-	if gas <= 0 {
-		gas = 1
-	}
-	if c.cost == nil || c.cost.base <= 0 {
-		return gas
-	}
-	infl := c.cost.inflation(n)
-	if infl <= 0 {
-		infl = 1
-	}
-	if nTx < 1 {
-		nTx = 1
-	}
-	return c.cost.fixedNs*infl + float64(nTx)*c.cost.txFixed*infl + gas*c.cost.base*infl
-}
-
-func (c *crew) predictGas(cp, work float64, n int, localR float64) float64 {
-	if n < 1 {
-		n = 1
-	}
-	r := c.cost.reexecRate(n)
-	if localR > r {
-		r = localR
-	}
-	par := work / float64(n)
-	if cp > par {
-		par = cp
-	}
-	if par < 1 {
-		par = 1
-	}
-	return par * (1 + r)
 }
 
 // path is the critical path and the total work of transactions at index
@@ -910,9 +850,20 @@ func (c *crew) seedWeights() {
 	}
 }
 
+func (c *crew) workEstimate() float64 {
+	var s float64
+	for _, w := range c.weight {
+		s += w
+	}
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
+
 func (c *crew) priorWeight(i int) float64 {
 	if c.txs == nil || i < 0 || i >= len(c.txs) || c.txs[i] == nil {
-		if c.cost.meanGas > 0 {
+		if c.cost != nil && c.cost.meanGas > 0 {
 			return c.cost.meanGas
 		}
 		return 1
@@ -921,20 +872,22 @@ func (c *crew) priorWeight(i int) float64 {
 	prior := 0.0
 	if g := tx.Gas(); g > 0 {
 		prior = float64(g)
-		if c.cost.util > 0 && c.cost.util < 1 {
+		if c.cost != nil && c.cost.util > 0 && c.cost.util < 1 {
 			prior *= c.cost.util
 		}
-	} else if c.cost.meanGas > 0 {
+	} else if c.cost != nil && c.cost.meanGas > 0 {
 		prior = c.cost.meanGas
 	} else {
 		prior = 1
 	}
-	if st, ok := c.cost.sel[selectorOf(tx)]; ok && st.n > 0 {
-		base := prior
-		if base <= 0 {
-			base = st.gas
+	if c.cost != nil {
+		if st, ok := c.cost.sel[selectorOf(tx)]; ok && st.n > 0 {
+			base := prior
+			if base <= 0 {
+				base = st.gas
+			}
+			return (selShrink*base + st.n*st.gas) / (selShrink + st.n)
 		}
-		return (selShrink*base + st.n*st.gas) / (selShrink + st.n)
 	}
 	return prior
 }
@@ -952,7 +905,7 @@ func selectorOf(tx *types.Transaction) selKey {
 }
 
 func (c *crew) learnSel(tx int, gas float64) {
-	if c.txs == nil || tx < 0 || tx >= len(c.txs) || c.txs[tx] == nil || gas <= 0 {
+	if c.cost == nil || c.txs == nil || tx < 0 || tx >= len(c.txs) || c.txs[tx] == nil || gas <= 0 {
 		return
 	}
 	key := selectorOf(c.txs[tx])
@@ -964,58 +917,7 @@ func (c *crew) learnSel(tx int, gas float64) {
 		st.gas += (gas - st.gas) / st.n
 	}
 	c.cost.sel[key] = st
-}
-
-func (c *crew) openSeg(n int, tail bool) {
-	if n < 1 {
-		n = 1
-	}
-	w := c.liveWidth
-	if w < 1 {
-		w = n
-	}
-	o := &openSeg{c: n, widthMin: w, tail: tail, rolls0: c.rolls}
-	if c.clock != nil {
-		o.start, o.cpu0 = c.clock()
-	}
-	c.open = o
-}
-
-func (c *crew) foldOpen() {
-	if c.open == nil {
-		return
-	}
-	seg := c.snapshot()
-	c.segments = append(c.segments, seg)
-	c.open = nil
-	if seg.WallNs == 0 || seg.Tail {
-		return
-	}
-	c.cost.ObserveSegments([]Segment{seg})
-}
-
-func (c *crew) snapshot() Segment {
-	seg := Segment{
-		C:     c.open.c,
-		Gas:   c.open.gas,
-		Execs: c.open.execs,
-		Rolls: c.rolls - c.open.rolls0,
-		Width: c.open.widthMin,
-		Tail:  c.open.tail,
-	}
-	if seg.Width < 1 {
-		seg.Width = seg.C
-	}
-	if c.clock != nil && !c.open.start.IsZero() {
-		now, cpu := c.clock()
-		if d := now.Sub(c.open.start); d > 0 {
-			seg.WallNs = uint64(d)
-		}
-		if cpu > c.open.cpu0 {
-			seg.CPUNs = uint64(cpu - c.open.cpu0)
-		}
-	}
-	return seg
+	c.cost.meanGas = ema(c.cost.meanGas, gas, 0.25)
 }
 
 func (c *crew) apply(n int) (int, bool) {
@@ -1025,23 +927,22 @@ func (c *crew) apply(n int) (int, bool) {
 	if n > c.limit {
 		n = c.limit
 	}
+	if c.active > 0 && n > c.active {
+		n = c.active
+	}
 	if n == c.active {
 		return c.active, false
 	}
 	c.active = n
-	c.note()
-	return c.active, true
-}
-
-func (c *crew) note() {
 	if len(c.trace) == 0 || c.trace[len(c.trace)-1] != c.active {
 		c.trace = append(c.trace, c.active)
 	}
+	return c.active, true
 }
 
 func (c *crew) Active() int { return c.active }
 
-// Best is the last body choice. Tail drain does not change it.
+// Best is the arm chosen for the body. Guards and tail drain do not change it.
 func (c *crew) Best() int {
 	if c.bestC > 0 {
 		return c.bestC
@@ -1050,14 +951,6 @@ func (c *crew) Best() int {
 		return c.active
 	}
 	return 1
-}
-
-// BodyGas is the gas-equivalent prediction of the starting choice.
-func (c *crew) BodyGas() float64 {
-	if c.startG > 0 {
-		return c.startG
-	}
-	return c.bodyG
 }
 
 func (c *crew) Trace() string {
@@ -1071,58 +964,13 @@ func (c *crew) Trace() string {
 	return strings.Join(parts, "-")
 }
 
-// Curve is the opening full-block prediction for every feasible C, in
-// nanoseconds when base is known and in gas-equivalents otherwise.
-// model_pred_ns is the pair for the opening choice, captured before this
-// block's segments are folded in.
+// Curve is the opening plan over the arm grid, captured before this
+// block's body is folded in. model_pred_ns is the pair for the chosen
+// arm when the unit is nanoseconds, and 0 when nothing has been measured.
 func (c *crew) Curve() (unit string, chosen int, pred int64, text string) {
-	chosen = c.Best()
-	unit = "gas"
-	if c.startNS {
-		unit = "ns"
+	unit = c.planUnit
+	if unit == "" {
+		unit = "gas"
 	}
-	val := 0.0
-	if c.startScore != nil {
-		val = c.startScore[chosen]
-	}
-	if val <= 0 {
-		nTx := c.n
-		if nTx < 1 {
-			nTx = 1
-		}
-		val = c.score(chosen, c.BodyGas(), nTx)
-	}
-	if unit == "ns" && val > 0 {
-		pred = int64(val)
-	}
-	src := c.startScore
-	if len(src) == 0 {
-		src = map[int]float64{}
-		nTx := c.n
-		if nTx < 1 {
-			nTx = 1
-		}
-		for n, g := range c.predG {
-			src[n] = c.score(n, g, nTx)
-		}
-	}
-	keys := make([]int, 0, len(src))
-	for n := range src {
-		if n >= 1 && n <= c.limit {
-			keys = append(keys, n)
-		}
-	}
-	sort.Ints(keys)
-	var b strings.Builder
-	b.WriteString(unit)
-	b.WriteByte(':')
-	for i, n := range keys {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(strconv.Itoa(n))
-		b.WriteByte('=')
-		b.WriteString(strconv.FormatInt(int64(src[n]), 10))
-	}
-	return unit, chosen, pred, b.String()
+	return unit, c.Best(), c.planPred, c.planText
 }

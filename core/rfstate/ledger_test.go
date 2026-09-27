@@ -233,16 +233,49 @@ func TestLearnerGreedy(t *testing.T) {
 	if !l.Fenced(k) {
 		t.Fatal("conflicts should fence")
 	}
-	if l.Choose(k, true) != FenceWaitFinal {
-		t.Fatal("mean above 1/2 should wait")
+	// Conflicts alone do not fence. The unitless prior has no nanosecond
+	// wait or re-execution cost, so the inequality cannot hold.
+	if l.Choose(k, true) != FencePass {
+		t.Fatal("conflicts without durations should pass")
 	}
 	if l.Choose(k, false) != FencePass {
 		t.Fatal("no producer cannot wait-final")
+	}
+	// Half a 100ns producer is 50. pc ≈ 41/73 ≈ 0.56, so 50 < 0.56*1000.
+	l.ObserveProducer(k, 100)
+	l.ObserveReexec(k, 1000)
+	if l.Choose(k, true) != FenceWaitFinal {
+		t.Fatal("cheap wait against an expensive replay should wait")
 	}
 	cp := l.Clone()
 	cp.ObserveSafe(k)
 	if l.Choose(k, true) != FenceWaitFinal {
 		t.Fatal("clone must not mutate the source")
+	}
+	for i := 0; i < 4; i++ {
+		l.ObserveWait(k, 5000)
+	}
+	if l.Choose(k, true) != FencePass {
+		t.Fatal("measured wait longer than the replay it avoids should pass")
+	}
+}
+
+func TestLearnerCostCarriesDelta(t *testing.T) {
+	base := NewLearner()
+	k := SlotKeyOf(common.Address{3}, common.Hash{3})
+	base.ObserveConflict(k)
+	before := base.Clone()
+	run := before.Clone()
+	run.ObserveProducer(k, 100)
+	run.ObserveReexec(k, 1000)
+	carried := before.Clone()
+	carried.Decay()
+	carried.ApplyDelta(before, run)
+	if carried.Choose(k, true) != FenceWaitFinal {
+		t.Fatal("carried prior dropped the duration samples")
+	}
+	if before.Choose(k, true) != FencePass {
+		t.Fatal("apply mutated the pre-run clone")
 	}
 }
 

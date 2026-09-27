@@ -36,6 +36,8 @@ type Signal struct {
 	Kind   SigKind
 	Depend int
 	Seq    int
+	// Key is the storage key a WAIT_FINAL parked on, when Kind is that wait.
+	Key Key
 }
 
 func (s Signal) Error() string { return "rfstate signal" }
