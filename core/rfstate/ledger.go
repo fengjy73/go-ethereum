@@ -309,6 +309,7 @@ func (l *Ledger) Publish(tx int, k Key, data []byte, estimate bool, base []byte)
 	l.noteWrite(tx, k)
 	if len(victims) > 0 && l.learner != nil {
 		l.learner.ObserveConflict(k)
+		l.learner.ObserveFanout(k, len(victims))
 	}
 	if l.onInvalidate != nil {
 		for _, v := range victims {
@@ -468,12 +469,31 @@ func (l *Ledger) fire(k Key, victims []Victim) {
 	}
 	if l.learner != nil {
 		l.learner.ObserveConflict(k)
+		l.learner.ObserveFanout(k, len(victims))
 	}
 	if l.onInvalidate != nil {
 		for _, v := range victims {
 			l.onInvalidate(v)
 		}
 	}
+}
+
+// PendingReaders counts readers of k other than tx. The fence uses it as a
+// lower bound on the invalidation fanout before a fanout sample exists.
+func (l *Ledger) PendingReaders(k Key, tx int) int {
+	ks := l.existing(k)
+	if ks == nil {
+		return 0
+	}
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	n := 0
+	for _, r := range ks.readers {
+		if r.tx != tx {
+			n++
+		}
+	}
+	return n
 }
 
 // LowerProducer is the highest transaction index below tx that has published k.

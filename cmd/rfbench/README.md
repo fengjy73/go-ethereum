@@ -56,8 +56,9 @@ setup, not an engine warm-up. Engine state is still fresh on every timed run.
 # this VM (4 cores). Pass both fixture trees; they are sorted by block number.
 # With GOMAXPROCS unset, the process sets it once to the largest -c (here 8),
 # or to the worker pin list when rf-auto is selected. rf-auto ignores -c.
-# During an rf-auto block the coordinator loop sets GOMAXPROCS to the active
-# count and restores the cap before the run returns. Fixed engines do not.
+# During an rf-auto block the process affinity and GOMAXPROCS shrink to the
+# chosen arm (workers plus one coordinator CPU) and both are restored
+# before the run returns. Fixed engines do not.
 GOGC=100 ./rfbench \
   -fixtures /path/to/fixa,/path/to/fixb \
   -engines serial,occ,rf,rf-auto \
@@ -76,9 +77,10 @@ once to the largest `-c` value (for `rf-auto`, to the worker pin list).
 Fixed engines should set `GOMAXPROCS=C+1` so the coordinator has a P that
 is not one of the pinned workers. `rf-auto` must not use that +1: its cap
 is `min(pin list, GOMAXPROCS)`, and an extra P would wake an extra worker.
-During an auto block the coordinator loop tracks `GOMAXPROCS` to the active
-count and restores the cap before the run returns. Inactive workers wait
-on the pool condition.
+After `rf-auto` picks an arm it shrinks every thread's affinity and
+`GOMAXPROCS` to that arm's workers plus one coordinator CPU, then restores
+both before the run returns. Fixed engines are unchanged. Inactive workers
+wait on the pool condition.
 
 The default does **not** call `LockOSThread` on the coordinator. It asks
 the OS to prefer the current thread on the first last-level cache, and the
@@ -164,18 +166,21 @@ Blocks are sorted by number. Priors for block N come only from blocks below N.
 
 A key is fenced after its first invalidation. `WAIT_FINAL` is chosen only
 when a lower producer exists and the expected wait is strictly shorter
-than the expected re-execution it avoids:
+than the conflict's re-execution, including the readers a bad pass would
+invalidate:
 
 ```
-E[wait] < P(conflict) * E[re-exec]
+E[wait] < P(conflict) * E[re-exec] * (1 + dependents)
 ```
 
-Until both sides have a nanosecond estimate the choice is PASS. The wait
-estimate is the measured park time after four samples, otherwise half the
-successful producer's attempt. The re-execution estimate is the wall time
-of an attempt that a write of that key invalidated. The cold prior is
-Beta(1, 32) with no durations, so it cannot satisfy the inequality.
-Nothing is injected from a global hot set.
+`dependents` is the larger of the learned invalidation fanout and the
+number of other readers already registered on the key. With no dependents
+the factor is 1. Until both sides have a nanosecond estimate the choice
+is PASS. The wait estimate is the measured park time after four samples,
+otherwise half the successful producer's attempt. The re-execution
+estimate is the wall time of an attempt that a write of that key
+invalidated. The cold prior is Beta(1, 32) with no durations, so it
+cannot satisfy the inequality. Nothing is injected from a global hot set.
 
 ### Learned worker count (`rf-auto`)
 
@@ -183,11 +188,17 @@ Nothing is injected from a global hot set.
 pin list, also capped by the `GOMAXPROCS` captured at block start, so an
 explicit `GOMAXPROCS=1` stays at one. Inactive workers leave the scheduler
 and wait on the pool condition; they are not parked inside `Step`. The
-coordinator owns every later `GOMAXPROCS` write: it sets the count to the
-plan before workers are released, a generation-checked loop applies later
-changes, and `ExecAuto` restores the cap before it returns. A deferred
+coordinator owns every later `GOMAXPROCS` write. After the arm `C` is
+chosen, every OS thread is moved onto the CPUs of those `C` workers plus
+one coordinator CPU when the pin list has one (the same footprint as a
+fixed engine at that `C`). `GOMAXPROCS` becomes that footprint, capped by
+the process cap captured at block start. The pool's active count stays at
+`C`, so the extra P does not wake another worker. A generation-checked
+loop applies later shrinks the same way, and `ExecAuto` restores both the
+cap and the previous per-thread masks before it returns. A deferred
 update carries the `Drive` generation and is ignored once the next block
-has started.
+has started. Fixed engines do not take this path; launch them as their
+own process with `GOMAXPROCS=C+1`.
 
 The count is one arm for the whole body, drawn from a geometric grid
 inside the cap: powers of two, plus the cap when it is not a power of
@@ -221,8 +232,10 @@ Normal(posterior mean, variance of the mean) and takes the minimum.
 Clones of the same pre-block model share the seed, so the K runs of one
 block pick the same arm.
 
-Arms above the opening frontier width are not eligible. A single-sender
-chain therefore cannot be assigned a wide arm.
+The arm set is that grid for the cap only. The opening frontier width is
+not an arm: a width of 25 on a cap of 32 used to add 25 to `{1,2,4,8,16,32}`.
+The chosen arm is clamped down to the greatest grid rung that does not
+exceed the width, so a single-sender chain still runs at 1.
 
 In-block changes are guards only. The frontier width is an EWMA with
 alpha 0.25; the integer cap moves when the average is a full worker away,
@@ -237,7 +250,9 @@ the whole block and uses the solo path. Before a serial rate exists that
 is fewer than 48 transactions. Afterwards it is
 `gas * serialRate < 2 * startupNs`, where `startupNs` starts at 2.5ms and
 is an EMA of the wall a wider arm spent above the serial rate, capped at
-half that wall. Solo is safe only because the active count never grows.
+half that wall. The EMA never falls below the smallest positive excess
+measured so far, so a long run of blocks with no excess cannot decay the
+threshold to zero. Solo is safe only because the active count never grows.
 A block that opens above 1 stays off the solo path when a guard later
 drops it to 1.
 
@@ -279,10 +294,16 @@ same transaction: the wipe and the slot would otherwise share a tx index,
 and the slot would stay visible. Publishing the same bytes again at
 transaction end does not invalidate readers.
 
-A coinbase balance read is a reader of the fee aggregate, not only of the
-prefix fence. The scheduler checks the observed prefix again before the
-attempt can become final. The C=1 fast path, which skips fences, is used
-only when the engine is statically one worker for the whole block.
+A genuine coinbase balance read (`BALANCE`, `SELFBALANCE`, a transfer
+from the coinbase, or the coinbase as sender) waits for the prefix and is
+a reader of the fee aggregate. The scheduler checks that sum again before
+the attempt can become final. `Empty` and `Exist` of the coinbase do not
+wait: they are predicates, recomputed once every lower transaction is
+final, and a mismatch requeues the attempt. A credit to the coinbase from
+a call value, selfdestruct, or the transaction fee is recorded into that
+same aggregate rather than loaded as a balance. The C=1 fast path, which
+skips fences, is used only when the engine is statically one worker for
+the whole block.
 
 ### CSV
 

@@ -126,9 +126,10 @@ func main() {
 	// rf-auto's pool, and when GOMAXPROCS is unset the process cap, equal
 	// the worker pin list. Fixed engines should be started with
 	// GOMAXPROCS=C+1 so the unpinned coordinator has a P that is not a
-	// worker thread. rf-auto must not use C+1: autoLimit would wake an
-	// extra worker. The coordinator loop tracks GOMAXPROCS to the active
-	// count during the block and restores the cap before the run returns.
+	// worker thread. rf-auto must not be launched at C+1: autoLimit would
+	// wake an extra worker. After an arm is chosen, ExecAuto shrinks
+	// GOMAXPROCS and every thread's affinity to that arm's workers plus
+	// one coordinator CPU, then restores both before the run returns.
 	// An explicit GOMAXPROCS is the cap and is not raised.
 	// -pin-coordinator locks the main goroutine to one CPU. At GOMAXPROCS=C
 	// that was slower than leaving it unpinned in the same cache.

@@ -27,7 +27,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rfstate"
 	"github.com/ethereum/go-ethereum/core/types"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -101,6 +100,10 @@ type CostPrior struct {
 	meanGas    float64
 	serialRate float64
 	startupNs  float64
+	// startupMin is the smallest positive startup excess measured so far.
+	// The EMA must not fall below it: a run of blocks with no excess used
+	// to decay startupNs to 0 and the tiny-block rule stopped firing.
+	startupMin float64
 	// step selects the Thompson seed. Clones copy it, so K runs of one
 	// block draw the same arm. The run that is kept has stepped once.
 	step uint64
@@ -132,6 +135,7 @@ func (c *CostPrior) Clone() *CostPrior {
 	out.meanGas = c.meanGas
 	out.serialRate = c.serialRate
 	out.startupNs = c.startupNs
+	out.startupMin = c.startupMin
 	out.step = c.step
 	for k, v := range c.arms {
 		out.arms[k] = v
@@ -330,10 +334,16 @@ func (c *CostPrior) ObserveArm(arm int, wallNs, gas uint64) {
 		if excess > float64(wallNs)*0.5 {
 			excess = float64(wallNs) * 0.5
 		}
+		if excess > 0 && (c.startupMin == 0 || excess < c.startupMin) {
+			c.startupMin = excess
+		}
 		if c.startupNs <= 0 {
 			c.startupNs = excess
 		} else {
 			c.startupNs = c.startupNs*0.8 + excess*0.2
+		}
+		if c.startupMin > 0 && c.startupNs < c.startupMin {
+			c.startupNs = c.startupMin
 		}
 	}
 	c.Chosen = arm
@@ -431,7 +441,7 @@ type crew struct {
 	execs     uint64
 	trace     []int
 
-	clock    func() (time.Time, int64)
+	clock    func() time.Time
 	bodyAt   time.Time
 	planUnit string
 	planPred int64
@@ -465,11 +475,13 @@ func newCrew(cost *CostPrior, limit int, env *BlockEnv) *crew {
 	return c
 }
 
-func (c *crew) setClock(fn func() (time.Time, int64)) { c.clock = fn }
+func (c *crew) setClock(fn func() time.Time) { c.clock = fn }
 
 // begin seeds weights, picks the arm, and returns it. width is the
-// opening structural frontier. Arms above that width are not eligible:
-// a single-sender chain has nothing for them to run.
+// opening structural frontier. The arm set is armGrid(limit) only: powers
+// of two up to the cap, plus the cap. A frontier of 25 must not become an
+// arm. The chosen arm is then clamped down to the greatest grid rung that
+// does not exceed width, so a single-sender chain still runs at 1.
 func (c *crew) begin(width int) int {
 	c.seedWeights()
 	if width < 1 {
@@ -494,25 +506,36 @@ func (c *crew) begin(width int) int {
 	if c.cost != nil {
 		ref = c.cost.refRate()
 	}
-	eligible := c.widthC
-	if eligible < 1 {
-		eligible = 1
-	}
+	grid := armGrid(c.limit)
 	picked := 1
 	if c.cost != nil && !c.cost.tooSmall(c.n, gasEst) {
-		picked = c.cost.pick(armGrid(eligible), ref, speedup)
+		picked = c.cost.pick(grid, ref, speedup)
 	}
-	if picked > eligible {
-		picked = eligible
+	if picked > c.widthC {
+		picked = gridFloor(grid, c.widthC)
 	}
 	if picked < 1 {
 		picked = 1
+	}
+	if c.cost != nil {
+		c.cost.Chosen = picked
 	}
 	c.active = picked
 	c.bestC = picked
 	c.trace = []int{picked}
 	c.snapshotPlan(picked, ref, speedup, gasEst)
 	return picked
+}
+
+// gridFloor is the greatest arm in grid that is still <= width.
+func gridFloor(grid []int, width int) int {
+	best := 1
+	for _, a := range grid {
+		if a <= width && a >= best {
+			best = a
+		}
+	}
+	return best
 }
 
 func (c *crew) snapshotPlan(picked int, ref, speedup, gasEst float64) {
@@ -560,7 +583,7 @@ func (c *crew) startSegment() {
 		return
 	}
 	if c.clock != nil {
-		c.bodyAt, _ = c.clock()
+		c.bodyAt = c.clock()
 		return
 	}
 	c.bodyAt = time.Now()
@@ -584,7 +607,7 @@ func (c *crew) rewardBody() {
 	}
 	var wall uint64
 	if c.clock != nil && !c.bodyAt.IsZero() {
-		now, _ := c.clock()
+		now := c.clock()
 		if d := now.Sub(c.bodyAt); d > 0 {
 			wall = uint64(d)
 		}
@@ -594,14 +617,6 @@ func (c *crew) rewardBody() {
 		arm = 1
 	}
 	c.cost.ObserveArm(arm, wall, c.bodyGas)
-}
-
-func procCPU() int64 {
-	var usage unix.Rusage
-	if err := unix.Getrusage(unix.RUSAGE_SELF, &usage); err != nil {
-		return 0
-	}
-	return usage.Utime.Nano() + usage.Stime.Nano()
 }
 
 // observe applies shrink-only guards. done is a successful completion.
@@ -670,7 +685,7 @@ func (c *crew) bodyElapsed() int64 {
 	if c.clock == nil || c.bodyAt.IsZero() {
 		return 0
 	}
-	now, _ := c.clock()
+	now := c.clock()
 	d := now.Sub(c.bodyAt)
 	if d <= 0 {
 		return 0

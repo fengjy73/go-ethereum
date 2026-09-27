@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -257,6 +258,87 @@ func TestLearnerGreedy(t *testing.T) {
 	}
 	if l.Choose(k, true) != FencePass {
 		t.Fatal("measured wait longer than the replay it avoids should pass")
+	}
+}
+
+type openPrefix struct{}
+
+func (openPrefix) PrefixFinal(int) bool { return false }
+func (openPrefix) TxSettled(int) bool   { return false }
+func (openPrefix) Parallel() bool       { return true }
+func (openPrefix) Solo() bool           { return false }
+
+type closedPrefix struct{}
+
+func (closedPrefix) PrefixFinal(int) bool { return true }
+func (closedPrefix) TxSettled(int) bool   { return true }
+func (closedPrefix) Parallel() bool       { return true }
+func (closedPrefix) Solo() bool           { return false }
+
+func TestCoinbaseBribeSkipsPrefixAndCreditsBalance(t *testing.T) {
+	coin := common.Address{0xC0}
+	store := NewStore(&World{Accounts: map[common.Address]*Account{
+		coin: {Exists: true, Balance: uint256.NewInt(1000), Nonce: 0},
+	}})
+	led := NewLedger(3, nil, nil)
+	v := NewTxView(ModeRF, 1, 1, 0, store, led, nil, openPrefix{}, nil, coin)
+	defer v.Release()
+	if v.Empty(coin) {
+		t.Fatal("funded coinbase looked empty")
+	}
+	if !v.Exist(coin) {
+		t.Fatal("funded coinbase looked missing")
+	}
+	v.AddBalance(coin, uint256.NewInt(7), tracing.BalanceChangeTransfer)
+	v.Publish()
+	sum := led.SumFees(2)
+	if sum == nil || sum.Uint64() != 7 {
+		t.Fatalf("bribe credit %v", sum)
+	}
+	func() {
+		defer func() {
+			rec := recover()
+			sig, ok := rec.(Signal)
+			if !ok || sig.Kind != SigWaitPrefix {
+				t.Fatalf("BALANCE(coinbase) did not wait: %v", rec)
+			}
+		}()
+		waiting := NewTxView(ModeRF, 2, 1, 0, store, led, nil, openPrefix{}, nil, coin)
+		defer waiting.Release()
+		waiting.GetBalance(coin)
+		t.Fatal("BALANCE(coinbase) returned without waiting")
+	}()
+	reader := NewTxView(ModeRF, 2, 1, 0, store, led, nil, closedPrefix{}, nil, coin)
+	defer reader.Release()
+	if got := reader.GetBalance(coin); got == nil || got.Uint64() != 1007 {
+		t.Fatalf("later balance %v", got)
+	}
+}
+
+func TestLearnerCascadeAtWideC(t *testing.T) {
+	l := NewLearner()
+	k := SlotKeyOf(common.Address{9}, common.Hash{9})
+	for i := 0; i < 40; i++ {
+		l.ObserveConflict(k)
+	}
+	// Half of a 10us producer is 5us. One 1us replay does not pay for that
+	// wait, so a single reader still passes. Thirty dependents at wide C
+	// make the cascade more expensive than the wait.
+	l.ObserveProducer(k, 10_000)
+	l.ObserveReexec(k, 1_000)
+	if l.Choose(k, true) != FencePass {
+		t.Fatal("one reader should pass when the wait is the expensive side")
+	}
+	if l.ChooseWith(k, true, 30) != FenceWaitFinal {
+		t.Fatal("thirty live readers should wait")
+	}
+	l.ObserveFanout(k, 30)
+	if l.Choose(k, true) != FenceWaitFinal {
+		t.Fatal("learned fanout should wait on the next reader")
+	}
+	carried := l.Clone()
+	if carried.Choose(k, true) != FenceWaitFinal {
+		t.Fatal("fanout did not clone")
 	}
 }
 

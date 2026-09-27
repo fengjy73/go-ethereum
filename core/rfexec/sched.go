@@ -126,13 +126,13 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 	var gate *procGate
 	if auto {
 		s.mu.Lock()
-		s.width = s.frontierWidthLocked()
+		s.width = s.widthNowLocked()
 		s.mu.Unlock()
 		limit := autoLimit(pool, procCap)
 		s.crew = newCrew(cost.Clone(), limit, env)
-		s.crew.setClock(func() (time.Time, int64) {
-			return time.Now(), procCPU()
-		})
+		// Wall only. Process CPU was sampled under the scheduler lock on
+		// every guard and then discarded.
+		s.crew.setClock(time.Now)
 		workers = s.crew.begin(s.width)
 		// The arm is fixed for the block. Guards only shrink, so an opening
 		// of 1 never overlaps another attempt and may take the solo path.
@@ -145,12 +145,21 @@ func execParallel(env *BlockEnv, mode rfstate.Mode, pool *rfstate.Pool, workers 
 		// Drive's generation is the current value plus one; this coordinator
 		// is the only caller. The initial GOMAXPROCS write happens here,
 		// before any worker is released. Later writes belong to the gate.
+		// Affinity of every thread shrinks to this arm's footprint and is
+		// restored before ExecAuto returns, including on panic.
 		gate = newProcGate(procCap)
+		mask := newProcMask(pool.CPUs())
 		s.proc = gate
+		s.mask = mask
 		nextGen := pool.Generation() + 1
 		gate.arm(nextGen)
-		runtime.GOMAXPROCS(workers)
-		defer gate.restore()
+		mask.arm(nextGen)
+		mask.shrink(nextGen, workers)
+		runtime.GOMAXPROCS(procsFor(pool.CPUs(), workers, procCap))
+		defer func() {
+			gate.restore()
+			mask.restore()
+		}()
 	}
 	s.bindWorkers(pool.Width())
 	if s.crew != nil {
@@ -242,6 +251,48 @@ func autoLimit(pool *rfstate.Pool, procCap int) int {
 	return n
 }
 
+// syncWidthLocked recomputes the frontier width from scratch. Scheduling
+// events then maintain span one transaction at a time.
+func (s *sched) syncWidthLocked() {
+	s.span = 0
+	for i := range s.txs {
+		s.txs[i].inWidth = false
+		s.refreshOneLocked(i)
+	}
+}
+
+func (s *sched) refreshWidthLocked(i int) {
+	s.refreshOneLocked(i)
+	if i >= 0 && i < len(s.nextSame) {
+		s.refreshOneLocked(s.nextSame[i])
+	}
+}
+
+func (s *sched) refreshOneLocked(i int) {
+	if i < 0 || i >= len(s.txs) {
+		return
+	}
+	now := i >= s.frontier &&
+		(s.txs[i].status == stReady || s.txs[i].status == stRunning) &&
+		!s.senderBlockedLocked(i)
+	if now == s.txs[i].inWidth {
+		return
+	}
+	s.txs[i].inWidth = now
+	if now {
+		s.span++
+	} else if s.span > 0 {
+		s.span--
+	}
+}
+
+func (s *sched) widthNowLocked() int {
+	if s.span < 1 {
+		return 1
+	}
+	return s.span
+}
+
 type txRec struct {
 	status     status
 	attempt    uint64
@@ -278,6 +329,12 @@ type txRec struct {
 	// can become final.
 	sawCoin bool
 	feeSum  *uint256.Int
+	// preds are Empty/Exist observations of the coinbase. They are
+	// recomputed at finalize instead of parking the attempt.
+	preds []rfstate.CoinPred
+	// inWidth is whether this transaction currently contributes to the
+	// incremental frontier width.
+	inWidth bool
 }
 
 type sched struct {
@@ -296,14 +353,19 @@ type sched struct {
 	evms     []*vm.EVM
 	jumps    vm.JumpDestCache
 
-	pool        *rfstate.Pool
-	procCap     int
-	auto        bool
-	solo        bool
-	proc        *procGate
-	crew        *crew
-	width       int
-	pendingSafe []rfstate.Key
+	pool           *rfstate.Pool
+	procCap        int
+	auto           bool
+	solo           bool
+	proc           *procGate
+	mask           *procMask
+	crew           *crew
+	width          int
+	span           int
+	nextSame       []int
+	advancing      bool
+	advanceWaiters int
+	pendingSafe    []rfstate.Key
 }
 
 func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *rfstate.Learner) *sched {
@@ -317,6 +379,18 @@ func newSched(env *BlockEnv, mode rfstate.Mode, store *rfstate.Store, learner *r
 	s.cv = sync.NewCond(&s.mu)
 	s.ledger = rfstate.NewLedger(len(env.Txs), learner, s.onVictim)
 	s.jumps = core.NewJumpDestCache()
+	s.nextSame = make([]int, len(s.txs))
+	for i := range s.nextSame {
+		s.nextSame[i] = -1
+	}
+	if env != nil {
+		for i, p := range env.PrevSame {
+			if p >= 0 && p < len(s.nextSame) && s.nextSame[p] < 0 {
+				s.nextSame[p] = i
+			}
+		}
+	}
+	s.syncWidthLocked()
 	return s
 }
 
@@ -454,6 +528,7 @@ func (s *sched) Step(worker int) {
 		s.txs[idx].hasConflict = false
 		s.txs[idx].hasParkKey = false
 		s.txs[idx].status = stRunning
+		s.refreshWidthLocked(idx)
 		s.txs[idx].abort.Store(false)
 		s.inflight++
 		s.ctr.Executions++
@@ -642,6 +717,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 			s.txs[idx].hasParkKey = true
 		}
 		s.txs[idx].status = stParked
+		s.refreshWidthLocked(idx)
 		s.txs[idx].waiting = true
 		s.txs[idx].waitStart = time.Now()
 		if s.parkDoneLocked(idx) {
@@ -649,6 +725,7 @@ func (s *sched) onSignal(idx int, attempt uint64, sig rfstate.Signal) {
 			// read condition cleared; repeating means the marker is stuck.
 			s.txs[idx].waiting = false
 			s.txs[idx].status = stReady
+			s.refreshWidthLocked(idx)
 			s.txs[idx].settledSpins++
 			if s.txs[idx].settledSpins > maxSettledSpins {
 				s.fatal = fmt.Errorf("block %d tx %d spinning on settled producer (signal %d depend %d)", s.env.Number, idx, sig.Kind, sig.Depend)
@@ -734,6 +811,7 @@ func (s *sched) onErr(idx int, attempt uint64, err error) {
 			s.txs[idx].park = prev
 			s.txs[idx].parkKind = rfstate.SigWaitFinal
 			s.txs[idx].status = stParked
+			s.refreshWidthLocked(idx)
 			s.txs[idx].waiting = true
 			s.txs[idx].waitStart = time.Now()
 			s.txs[idx].ffUntil = 0
@@ -795,7 +873,9 @@ func (s *sched) requeueRunningLocked(idx int) {
 	s.txs[idx].settledSpins = 0
 	s.txs[idx].ffUntil = 0
 	s.txs[idx].validated = false
+	s.txs[idx].preds = nil
 	s.txs[idx].status = stReady
+	s.refreshWidthLocked(idx)
 	if s.mode == rfstate.ModeOCC {
 		s.txs[idx].estimate = true
 	} else {
@@ -829,6 +909,7 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 		s.txs[idx].sawCoin = false
 		s.txs[idx].feeSum = nil
 	}
+	s.txs[idx].preds = view.CoinbasePreds()
 	s.txs[idx].gasUsed = result.UsedGas
 	s.txs[idx].failed = result.Failed()
 	s.txs[idx].logs = append([]*types.Log(nil), view.Logs()...)
@@ -836,6 +917,7 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 	s.txs[idx].validated = s.mode != rfstate.ModeOCC
 	s.txs[idx].settledSpins = 0
 	s.txs[idx].status = stFinished
+	s.refreshWidthLocked(idx)
 	s.txs[idx].evm = nil
 	s.inflight--
 	finalTx := s.tryAdvanceLocked()
@@ -879,6 +961,18 @@ func (s *sched) finish(idx int, attempt uint64, view *rfstate.TxView, result *co
 }
 
 func (s *sched) tryAdvanceLocked() []int {
+	for s.advancing {
+		s.advanceWaiters++
+		s.cv.Wait()
+		s.advanceWaiters--
+	}
+	s.advancing = true
+	defer func() {
+		s.advancing = false
+		if s.advanceWaiters > 0 {
+			s.cv.Broadcast()
+		}
+	}()
 	var finalTx []int
 	for s.frontier < len(s.txs) {
 		t := &s.txs[s.frontier]
@@ -893,6 +987,7 @@ func (s *sched) tryAdvanceLocked() []int {
 			ok, est := s.validateLocked(s.frontier)
 			if est >= 0 {
 				t.status = stParked
+				s.refreshWidthLocked(s.frontier)
 				t.park = est
 				t.parkKind = rfstate.SigWaitEstimate
 				t.waiting = true
@@ -913,13 +1008,54 @@ func (s *sched) tryAdvanceLocked() []int {
 			s.requeueFinishedLocked(tx)
 			return finalTx
 		}
+		if s.mode == rfstate.ModeRF && !s.coinPredsValid(tx) {
+			if s.frontier != tx || tx >= len(s.txs) || s.txs[tx].status != stFinished {
+				continue
+			}
+			s.ctr.Rollbacks++
+			s.requeueFinishedLocked(tx)
+			return finalTx
+		}
+		if s.frontier != tx || s.txs[tx].status != stFinished {
+			continue
+		}
+		t = &s.txs[tx]
 		if s.mode == rfstate.ModeRF {
 			finalTx = append(finalTx, tx)
 		}
 		t.status = stFinal
 		s.frontier++
+		s.refreshWidthLocked(tx)
 	}
 	return finalTx
+}
+
+// coinPredsValid checks Empty/Exist observations of the coinbase. The
+// ledger key lock is not taken while the scheduler lock is held: publishers
+// release the key lock before they take the scheduler lock.
+func (s *sched) coinPredsValid(tx int) bool {
+	if tx < 0 || tx >= len(s.txs) || len(s.txs[tx].preds) == 0 {
+		return true
+	}
+	preds := append([]rfstate.CoinPred(nil), s.txs[tx].preds...)
+	coin := s.env.Header.Coinbase
+	s.mu.Unlock()
+	ok := true
+	for _, p := range preds {
+		own := new(uint256.Int).Set(&p.OwnFee)
+		var got bool
+		if p.Empty {
+			got = rfstate.CoinbaseEmpty(s.store, s.ledger, tx, coin, own)
+		} else {
+			got = rfstate.CoinbaseExist(s.store, s.ledger, tx, coin)
+		}
+		if got != p.Val {
+			ok = false
+			break
+		}
+	}
+	s.mu.Lock()
+	return ok
 }
 
 func (s *sched) validateLocked(tx int) (bool, int) {
@@ -941,6 +1077,7 @@ func (s *sched) requeueFinishedLocked(idx int) {
 	s.txs[idx].settledSpins = 0
 	s.txs[idx].ffUntil = 0
 	s.txs[idx].validated = false
+	s.txs[idx].preds = nil
 	s.txs[idx].status = stReady
 	if s.mode == rfstate.ModeOCC {
 		s.txs[idx].estimate = true
@@ -950,6 +1087,7 @@ func (s *sched) requeueFinishedLocked(idx int) {
 	if s.frontier > idx {
 		s.frontier = idx
 	}
+	s.refreshWidthLocked(idx)
 }
 
 func (s *sched) parkDoneLocked(idx int) bool {
@@ -972,7 +1110,7 @@ func (s *sched) crewSampleLocked(tx int, gas uint64, done bool) (int, bool) {
 	if s.crew == nil {
 		return 0, false
 	}
-	w := s.frontierWidthLocked()
+	w := s.widthNowLocked()
 	s.width = w
 	return s.crew.observe(tx, s.frontier, w, gas, done, s.ctr.Rollbacks, s.ctr.IdleNs)
 }
@@ -1022,8 +1160,14 @@ func (s *sched) applyActive(n int, gen uint64) {
 	if !s.pool.SetActiveIf(gen, n) {
 		return
 	}
+	// GOMAXPROCS follows the footprint (workers plus a coordinator CPU),
+	// not the pool's active count. SetActiveIf stays at n so the extra P
+	// does not wake another worker.
 	if s.proc != nil {
-		s.proc.request(gen, n)
+		s.proc.request(gen, procsFor(s.pool.CPUs(), n, s.procCap))
+	}
+	if s.mask != nil {
+		s.mask.shrink(gen, n)
 	}
 	s.mu.Lock()
 	if s.pool.Generation() == gen && !s.doneLocked() {
@@ -1049,6 +1193,7 @@ func (s *sched) wakeLocked() {
 			s.txs[i].waiting = false
 		}
 		s.txs[i].status = stReady
+		s.refreshWidthLocked(i)
 	}
 }
 
@@ -1117,6 +1262,7 @@ func (s *sched) armLocked(tx int, attempt uint64) *vm.EVM {
 	t.abort.Store(false)
 	t.ffUntil = 0
 	t.validated = false
+	t.preds = nil
 	t.status = stReady
 	if s.mode == rfstate.ModeOCC {
 		t.estimate = true
@@ -1126,6 +1272,7 @@ func (s *sched) armLocked(tx int, attempt uint64) *vm.EVM {
 	if s.frontier > tx {
 		s.frontier = tx
 	}
+	s.refreshWidthLocked(tx)
 	s.wakeLocked()
 	s.cv.Broadcast()
 	return ev

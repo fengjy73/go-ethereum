@@ -72,6 +72,7 @@ type TxView struct {
 	ownFee  *uint256.Int
 	feeSum  *uint256.Int // lower-tx fees captured with the coinbase read
 	coinObs *uint256.Int
+	preds   []CoinPred
 
 	journal  []func()
 	snaps    []rev
@@ -190,6 +191,7 @@ func (v *TxView) recycle() {
 	v.refund = 0
 	v.feeSum = nil
 	v.coinObs = nil
+	v.preds = v.preds[:0]
 	v.thash = common.Hash{}
 	if v.access != nil {
 		v.access.reset()
@@ -218,6 +220,16 @@ func (v *TxView) CoinbaseObserved() (total, feeSum *uint256.Int) {
 
 // OwnFee is the transaction-local coinbase fee credit.
 func (v *TxView) OwnFee() *uint256.Int { return new(uint256.Int).Set(v.ownFee) }
+
+// CoinbasePreds are Empty/Exist observations of the coinbase that did not
+// wait for the prefix. The scheduler recomputes them once every lower
+// transaction is final.
+func (v *TxView) CoinbasePreds() []CoinPred {
+	if v == nil || len(v.preds) == 0 {
+		return nil
+	}
+	return append([]CoinPred(nil), v.preds...)
+}
 
 func (v *TxView) guard() {
 	if v.solo || v.mode == ModeDirect || v.abort == nil {
@@ -356,7 +368,11 @@ func (v *TxView) fence(k Key, seq int) {
 	v.regions++
 	v.Snapshot()
 	prod, ok := v.ledger.LowerProducer(v.tx, k)
-	if !ok || v.learner.Choose(k, true) != FenceWaitFinal {
+	live := 0
+	if v.ledger != nil {
+		live = v.ledger.PendingReaders(k, v.tx)
+	}
+	if !ok || v.learner.ChooseWith(k, true, live) != FenceWaitFinal {
 		return
 	}
 	if v.deps != nil && !v.deps.TxSettled(prod) {
@@ -581,6 +597,19 @@ func (v *TxView) AddBalance(addr common.Address, amount *uint256.Int, reason tra
 	v.guard()
 	if amount == nil {
 		amount = uint256.NewInt(0)
+	}
+	// Every coinbase credit, including CALL value and selfdestruct, joins the
+	// fee aggregate. A balance load here would WAIT_PREFIX, and the bribe
+	// sits at the end of the transaction so the whole attempt would rerun.
+	if v.mode == ModeRF && addr == v.coinbase && !(amount.IsZero() && v.solo) {
+		if amount.IsZero() && v.coinbaseEmptyPred() {
+			a := v.acct(addr)
+			if !a.touched {
+				v.undo(func() { a.touched = false })
+				a.touched = true
+			}
+		}
+		return v.addCoinbaseFee(amount)
 	}
 	if v.mode != ModeDirect && addr == v.coinbase && reason == tracing.BalanceIncreaseRewardTransactionFee {
 		return v.addCoinbaseFee(amount)
@@ -912,6 +941,12 @@ func (v *TxView) HasSelfDestructed(addr common.Address) bool {
 }
 
 func (v *TxView) Exist(addr common.Address) bool {
+	if v.mode == ModeRF && !v.solo && addr == v.coinbase {
+		if a := v.accs[addr]; a != nil && a.selfDestructed {
+			return true
+		}
+		return v.coinbaseExistPred()
+	}
 	a := v.acct(addr)
 	v.loadExist(addr, a)
 	if a.selfDestructed {
@@ -939,12 +974,35 @@ func (v *TxView) IsNewContract(addr common.Address) bool {
 }
 
 func (v *TxView) Empty(addr common.Address) bool {
+	if v.mode == ModeRF && !v.solo && addr == v.coinbase {
+		return v.coinbaseEmptyPred()
+	}
 	a := v.acct(addr)
 	v.loadExist(addr, a)
 	if !a.exists {
 		return true
 	}
 	return v.accountEmptyLoaded(addr, a)
+}
+
+func (v *TxView) coinbaseEmptyPred() bool {
+	var own uint256.Int
+	if v.ownFee != nil {
+		own.Set(v.ownFee)
+	}
+	val := CoinbaseEmpty(v.store, v.ledger, v.tx, v.coinbase, &own)
+	v.preds = append(v.preds, CoinPred{Empty: true, Val: val, OwnFee: own})
+	return val
+}
+
+func (v *TxView) coinbaseExistPred() bool {
+	var own uint256.Int
+	if v.ownFee != nil {
+		own.Set(v.ownFee)
+	}
+	val := CoinbaseExist(v.store, v.ledger, v.tx, v.coinbase)
+	v.preds = append(v.preds, CoinPred{Empty: false, Val: val, OwnFee: own})
+	return val
 }
 
 func (v *TxView) AddressInAccessList(addr common.Address) bool {

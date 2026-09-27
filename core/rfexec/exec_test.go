@@ -422,17 +422,19 @@ func TestFrontierWidthCountsReadyHeads(t *testing.T) {
 	s := newSched(env, rfstate.ModeRF, nil, nil)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if got := s.frontierWidthLocked(); got != 2 {
-		t.Fatalf("chain heads %d", got)
+	if got, scan := s.widthNowLocked(), s.frontierWidthLocked(); got != 2 || scan != 2 {
+		t.Fatalf("chain heads incremental %d scan %d", got, scan)
 	}
 	s.txs[0].status = stParked
-	if got := s.frontierWidthLocked(); got != 1 {
-		t.Fatalf("parked head %d", got)
+	s.refreshWidthLocked(0)
+	if got, scan := s.widthNowLocked(), s.frontierWidthLocked(); got != 1 || scan != 1 {
+		t.Fatalf("parked head incremental %d scan %d", got, scan)
 	}
 	s.txs[0].status = stFinal
 	s.frontier = 1
-	if got := s.frontierWidthLocked(); got != 2 {
-		t.Fatalf("unblocked successor %d", got)
+	s.refreshWidthLocked(0)
+	if got, scan := s.widthNowLocked(), s.frontierWidthLocked(); got != 2 || scan != 2 {
+		t.Fatalf("unblocked successor incremental %d scan %d", got, scan)
 	}
 }
 
@@ -646,4 +648,111 @@ func TestLoadPostPectraShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("serial %s gas %d", out.Wall, out.GasUsed)
+}
+
+func TestBribeToCoinbaseDoesNotPrefixWait(t *testing.T) {
+	env := bribeEnv(t, false)
+	serial, err := ExecSerial(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := rfstate.NewPool([]int{0, 1}, 2)
+	defer pool.Stop()
+	out, err := ProcessRegionFence(env, pool, 2, rfstate.NewLearner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Counters.WaitPrefix != 0 {
+		t.Fatalf("bribe waited on the prefix %d times", out.Counters.WaitPrefix)
+	}
+	if err := CheckAgainstSerial(serial, out, env.World); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBalanceSeesCoinbaseCredits(t *testing.T) {
+	env := bribeEnv(t, true)
+	serial, err := ExecSerial(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := rfstate.NewPool([]int{0, 1}, 2)
+	defer pool.Stop()
+	out, err := ProcessRegionFence(env, pool, 2, rfstate.NewLearner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckAgainstSerial(serial, out, env.World); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("wait_prefix %d", out.Counters.WaitPrefix)
+}
+
+func bribeEnv(t *testing.T, withBalance bool) *BlockEnv {
+	t.Helper()
+	aliceKey := mustKey(t)
+	bobKey := mustKey(t)
+	carolKey := mustKey(t)
+	alice := crypto.PubkeyToAddress(aliceKey.PublicKey)
+	bob := crypto.PubkeyToAddress(bobKey.PublicKey)
+	carol := crypto.PubkeyToAddress(carolKey.PublicKey)
+	coin := common.HexToAddress("0xc0ffee")
+	contract := common.HexToAddress("0x1000")
+	code := append([]byte{0x73}, coin.Bytes()...)
+	code = append(code, 0x31, 0x5f, 0x55, 0x00) // BALANCE, PUSH0, SSTORE, STOP
+	header := &types.Header{
+		ParentHash: common.HexToHash("0x01"),
+		Coinbase:   coin,
+		Number:     big.NewInt(21_000_000),
+		GasLimit:   30_000_000,
+		Time:       *params.MainnetChainConfig.CancunTime + 10,
+		Difficulty: big.NewInt(0),
+		BaseFee:    big.NewInt(1_000_000_000),
+	}
+	signer := types.LatestSigner(params.MainnetChainConfig)
+	fund := new(uint256.Int).Mul(uint256.NewInt(1_000_000_000_000_000), uint256.NewInt(1000))
+	mk := func(key *ecdsa.PrivateKey, nonce uint64, to common.Address, value int64, data []byte) *types.Transaction {
+		return types.MustSignNewTx(key, signer, &types.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     nonce,
+			GasTipCap: big.NewInt(1_000_000_000),
+			GasFeeCap: big.NewInt(2_000_000_000),
+			Gas:       100_000,
+			To:        &to,
+			Value:     big.NewInt(value),
+			Data:      data,
+		})
+	}
+	txs := []*types.Transaction{
+		mk(aliceKey, 0, bob, 1, nil),
+		mk(carolKey, 0, coin, 1000, nil),
+	}
+	world := &rfstate.World{
+		Accounts: map[common.Address]*rfstate.Account{
+			alice: {Exists: true, Balance: new(uint256.Int).Set(fund), Nonce: 0},
+			bob:   {Exists: true, Balance: new(uint256.Int).Set(fund), Nonce: 0},
+			carol: {Exists: true, Balance: new(uint256.Int).Set(fund), Nonce: 0},
+			coin:  {Exists: true, Balance: uint256.NewInt(1_000_000_000_000_000_000), Nonce: 0},
+		},
+		Slots: map[rfstate.SlotKey]common.Hash{},
+	}
+	if withBalance {
+		txs = append(txs, mk(bobKey, 0, contract, 0, nil))
+		world.Accounts[contract] = &rfstate.Account{Exists: true, Balance: uint256.NewInt(0), Nonce: 1, Code: code}
+	}
+	block := types.NewBlockWithHeader(header).WithBody(types.Body{Transactions: txs})
+	env := &BlockEnv{
+		Number:    header.Number.Uint64(),
+		Header:    block.Header(),
+		BlockHash: block.Hash(),
+		Block:     block,
+		Txs:       txs,
+		World:     world,
+		Hashes:    map[uint64]common.Hash{},
+		Chain:     newHeaderChain(params.MainnetChainConfig, block.Header(), map[uint64]common.Hash{}),
+	}
+	if err := env.prepareMessages(); err != nil {
+		t.Fatal(err)
+	}
+	return env
 }

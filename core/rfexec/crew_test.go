@@ -18,6 +18,8 @@ package rfexec
 
 import (
 	"math"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,6 +187,56 @@ func TestWideUntriedArmIsRare(t *testing.T) {
 	}
 	if n2 == 0 {
 		t.Fatalf("untried C=2 was never drawn in %d tries", draws)
+	}
+}
+
+func TestArmGridUsesCapNotWidth(t *testing.T) {
+	arms := armGrid(32)
+	if strings.Join(ints(arms), ",") != "1,2,4,8,16,32" {
+		t.Fatalf("grid %v", arms)
+	}
+	// A frontier of 25 used to be inserted as an arm beside the cap.
+	env := chainEnv(64, independentPrev(64), 100000)
+	c := newCrew(preferArm(32), 32, env)
+	if got := c.begin(25); got == 25 || got == 32 {
+		t.Fatalf("width 25 became arm %d", got)
+	}
+	if got := c.Best(); got != 16 {
+		t.Fatalf("clamped arm %d, want 16", got)
+	}
+	for _, a := range arms {
+		if a == c.Best() {
+			return
+		}
+	}
+	t.Fatalf("arm %d is not on the cap grid", c.Best())
+}
+
+func ints(ns []int) []string {
+	out := make([]string, len(ns))
+	for i, n := range ns {
+		out[i] = strconv.Itoa(n)
+	}
+	return out
+}
+
+func TestStartupDoesNotDecayBelowMin(t *testing.T) {
+	c := NewCostPrior()
+	c.ObserveArm(1, 8_000_000, 1_000_000)
+	c.ObserveArm(2, 9_000_000, 1_000_000)
+	if c.startupMin <= 0 {
+		t.Fatal("positive excess did not set a floor")
+	}
+	floor := c.startupMin
+	for i := 0; i < 40; i++ {
+		c.ObserveArm(2, 8_000_000, 1_000_000)
+	}
+	if c.startupNs < floor {
+		t.Fatalf("startup %v fell below measured minimum %v", c.startupNs, floor)
+	}
+	cloned := c.Clone()
+	if cloned.startupNs < floor || cloned.startupMin != floor {
+		t.Fatalf("clone startup %v min %v", cloned.startupNs, cloned.startupMin)
 	}
 }
 
@@ -481,8 +533,7 @@ func TestSelectorShrinksTowardLimit(t *testing.T) {
 }
 
 type fakeClock struct {
-	t   time.Time
-	cpu int64
+	t time.Time
 }
 
-func (f *fakeClock) now() (time.Time, int64) { return f.t, f.cpu }
+func (f *fakeClock) now() time.Time { return f.t }

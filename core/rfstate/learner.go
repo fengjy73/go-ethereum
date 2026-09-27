@@ -76,6 +76,10 @@ type keyCost struct {
 	waitV, waitN     float64
 	reexecV, reexecN float64
 	prodV, prodN     float64
+	// fanV is the expected number of other readers a write of this key
+	// invalidates. The pass cost multiplies re-execution by 1+fan so a
+	// wide block does not PASS a hot key and then cascade.
+	fanV, fanN float64
 }
 
 // Learner holds per-key Beta posteriors. WAIT_FINAL is chosen only when a
@@ -146,24 +150,40 @@ func (l *Learner) Fenced(k Key) bool {
 
 // Choose picks PASS or WAIT_FINAL. Coinbase and nonce are decided by the caller.
 //
-// E[pass] = P(conflict) * E[reexec], E[wait] = E[wait]. Wait only when the
-// wait is strictly cheaper. A missing nanosecond estimate on either side
-// is PASS: the unitless prior (wait 4, reexec 1) cannot satisfy the
-// inequality, and mixing it with a one-sided nanosecond sample would fence
-// every key after a single long replay.
+// E[pass] = P(conflict) * E[reexec] * (1 + dependents). Dependents are the
+// larger of the learned invalidation fanout and the live reader count passed
+// to ChooseWith. Wait only when that pass cost exceeds the wait. A missing
+// nanosecond estimate on either side is PASS: the unitless prior (wait 4,
+// reexec 1) cannot satisfy the inequality, and mixing it with a one-sided
+// nanosecond sample would fence every key after a single long replay.
+// With no dependents the factor is 1, so a single reader is unchanged.
 func (l *Learner) Choose(k Key, hasProducer bool) Fence {
+	return l.ChooseWith(k, hasProducer, 0)
+}
+
+// ChooseWith is Choose with a live count of other readers already registered
+// on k. A wide block passes that count so the first wave of a hot key can
+// wait before a fanout sample exists.
+func (l *Learner) ChooseWith(k Key, hasProducer bool, live int) Fence {
 	if l == nil || !hasProducer {
 		return FencePass
 	}
 	l.mu.Lock()
 	p := l.get(k)
 	wait, reexec, ok := l.costsLocked(k)
+	fan := 0.0
+	if c, hit := l.cost[k]; hit && c.fanN >= 1 {
+		fan = c.fanV
+	}
 	l.mu.Unlock()
 	if !ok {
 		return FencePass
 	}
+	if live > 0 && float64(live) > fan {
+		fan = float64(live)
+	}
 	pc := p.Alpha / (p.Alpha + p.Beta)
-	if wait < pc*reexec {
+	if wait < pc*reexec*(1+fan) {
 		return FenceWaitFinal
 	}
 	return FencePass
@@ -221,6 +241,8 @@ func (l *Learner) addCost(k Key, kind int, ns int64) {
 		observeCost(&c.reexecV, &c.reexecN, float64(ns))
 	case costProd:
 		observeCost(&c.prodV, &c.prodN, float64(ns))
+	case costFan:
+		observeCost(&c.fanV, &c.fanN, float64(ns))
 	}
 	l.cost[k] = c
 }
@@ -229,6 +251,7 @@ const (
 	costWait = iota
 	costReexec
 	costProd
+	costFan
 )
 
 // ObserveWait records how long a reader actually parked on k.
@@ -239,6 +262,14 @@ func (l *Learner) ObserveReexec(k Key, ns int64) { l.addCost(k, costReexec, ns) 
 
 // ObserveProducer records a successful attempt that wrote k.
 func (l *Learner) ObserveProducer(k Key, ns int64) { l.addCost(k, costProd, ns) }
+
+// ObserveFanout records how many other readers one write of k invalidated.
+func (l *Learner) ObserveFanout(k Key, n int) {
+	if n <= 0 {
+		return
+	}
+	l.addCost(k, costFan, int64(n))
+}
 
 // ObserveConflict records one push-invalidation against the key.
 func (l *Learner) ObserveConflict(k Key) {
